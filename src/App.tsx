@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
 type Device = {
@@ -18,6 +19,7 @@ function App() {
 
   const [micLevel, setMicLevel] = useState(0);
   const [muted, setMuted] = useState(false);
+  const [gameRunning, setGameRunning] = useState(false);
 
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
@@ -78,7 +80,6 @@ function App() {
       const analyser = audioContext.createAnalyser();
 
       analyser.fftSize = 256;
-
       source.connect(analyser);
 
       const data = new Uint8Array(analyser.frequencyBinCount);
@@ -108,6 +109,19 @@ function App() {
     };
   }, [selectedInput]);
 
+  useEffect(() => {
+    const checkGame = async () => {
+      const running = await invoke<boolean>("is_the_isle_running");
+      setGameRunning(running);
+    };
+
+    checkGame();
+
+    const interval = setInterval(checkGame, 3000);
+
+    return () => clearInterval(interval);
+  }, []);
+
   const changeInput = (deviceId: string) => {
     setSelectedInput(deviceId);
     localStorage.setItem("audioInput", deviceId);
@@ -134,6 +148,11 @@ function App() {
       <div className="status">
         <span className="dot" />
         Disconnected
+      </div>
+
+      <div className="status">
+        <span className={`dot ${gameRunning ? "online" : ""}`} />
+        The Isle: {gameRunning ? "Detected" : "Not Running"}
       </div>
 
       <div className="panel">

@@ -45,6 +45,10 @@
   filter: drop-shadow(0 0 2em #24c8db);
 }
 
+.dot.online {
+  background: #42b84a;
+}
+
 a {
   font-weight: 500;
   color: #646cff;
