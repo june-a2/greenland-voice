@@ -25,10 +25,18 @@ function App() {
 
   const [testMode, setTestMode] = useState(false);
   const [testDistance, setTestDistance] = useState(10);
+  const [testPan, setTestPan] = useState(0);
 
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
 
+  const testAudioContextRef = useRef<AudioContext | null>(null);
+  const testSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const testGainRef = useRef<GainNode | null>(null);
+  const testPannerRef = useRef<StereoPannerNode | null>(null);
+  const testDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(
+    null,
+  );
   const testAudioRef = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => {
@@ -177,48 +185,103 @@ function App() {
     });
   };
 
-  const proximityVolume = Math.max(0, 1 - testDistance / 50);
+  const maxDistance = 50;
 
-  const toggleTestMode = async () => {
-    if (!testMode) {
-      if (!streamRef.current) return;
+  const normalizedDistance = Math.min(testDistance / maxDistance, 1);
 
-      const audio = new Audio();
-      audio.srcObject = streamRef.current;
-      audio.volume = proximityVolume;
-
-      if ("setSinkId" in audio && selectedOutput) {
-        try {
-          await audio.setSinkId(selectedOutput);
-        } catch (error) {
-          console.error("Unable to set test output device:", error);
-        }
-      }
-
-      try {
-        await audio.play();
-        testAudioRef.current = audio;
-        setTestMode(true);
-      } catch (error) {
-        console.error("Unable to start test audio:", error);
-      }
-    } else {
-      testAudioRef.current?.pause();
-      testAudioRef.current = null;
-      setTestMode(false);
-    }
-  };
+  const proximityVolume = Math.pow(1 - normalizedDistance, 1.6);
 
   useEffect(() => {
-    if (testAudioRef.current) {
-      testAudioRef.current.volume = proximityVolume;
+    if (testGainRef.current) {
+      testGainRef.current.gain.value = proximityVolume;
     }
   }, [proximityVolume]);
 
   useEffect(() => {
+    if (testPannerRef.current) {
+      testPannerRef.current.pan.value = testPan / 100;
+    }
+  }, [testPan]);
+
+  const stopTestMode = async () => {
+    testAudioRef.current?.pause();
+    testAudioRef.current = null;
+
+    testSourceRef.current?.disconnect();
+    testSourceRef.current = null;
+
+    testGainRef.current?.disconnect();
+    testGainRef.current = null;
+
+    testPannerRef.current?.disconnect();
+    testPannerRef.current = null;
+
+    testDestinationRef.current?.disconnect();
+    testDestinationRef.current = null;
+
+    if (testAudioContextRef.current) {
+      await testAudioContextRef.current.close();
+      testAudioContextRef.current = null;
+    }
+
+    setTestMode(false);
+  };
+
+  const startTestMode = async () => {
+    if (!streamRef.current) return;
+
+    try {
+      const audioContext = new AudioContext();
+
+      const source = audioContext.createMediaStreamSource(streamRef.current);
+      const gain = audioContext.createGain();
+      const panner = audioContext.createStereoPanner();
+      const destination = audioContext.createMediaStreamDestination();
+
+      gain.gain.value = proximityVolume;
+      panner.pan.value = testPan / 100;
+
+      source.connect(gain);
+      gain.connect(panner);
+      panner.connect(destination);
+
+      const audio = new Audio();
+      audio.srcObject = destination.stream;
+
+      if ("setSinkId" in audio && selectedOutput) {
+        await audio.setSinkId(selectedOutput);
+      }
+
+      await audio.play();
+
+      testAudioContextRef.current = audioContext;
+      testSourceRef.current = source;
+      testGainRef.current = gain;
+      testPannerRef.current = panner;
+      testDestinationRef.current = destination;
+      testAudioRef.current = audio;
+
+      setTestMode(true);
+    } catch (error) {
+      console.error("Unable to start proximity test:", error);
+    }
+  };
+
+  const toggleTestMode = async () => {
+    if (testMode) {
+      await stopTestMode();
+    } else {
+      await startTestMode();
+    }
+  };
+
+  useEffect(() => {
     return () => {
       testAudioRef.current?.pause();
-      testAudioRef.current = null;
+
+      if (testAudioContextRef.current) {
+        testAudioContextRef.current.close();
+      }
     };
   }, []);
 
@@ -287,17 +350,32 @@ function App() {
         {testMode && (
           <>
             <label>
-              Test Player Distance: {testDistance}m
+              Distance: {testDistance}m
               <input
                 type="range"
                 min="0"
-                max="50"
+                max={maxDistance}
                 value={testDistance}
                 onChange={(e) => setTestDistance(Number(e.target.value))}
               />
             </label>
 
             <div>Simulated Volume: {Math.round(proximityVolume * 100)}%</div>
+
+            <label>
+              Position: {testPan}
+              <input
+                type="range"
+                min="-100"
+                max="100"
+                value={testPan}
+                onChange={(e) => setTestPan(Number(e.target.value))}
+              />
+            </label>
+
+            <div>
+              {testPan < -10 ? "Left" : testPan > 10 ? "Right" : "Center"}
+            </div>
           </>
         )}
       </div>
