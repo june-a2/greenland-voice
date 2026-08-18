@@ -32,12 +32,13 @@ function App() {
       name: string;
       steamId: string;
       distance: number;
+      volume: number;
     }[]
   >([]);
   const STEAM_ID = "76561199083876638";
   const [testMode, setTestMode] = useState(false);
-  const [testDistance, setTestDistance] = useState(10);
   const [testPan, setTestPan] = useState(0);
+  const [fakePlayerOffset, setFakePlayerOffset] = useState(1000);
 
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
@@ -204,16 +205,47 @@ function App() {
                 const dz = player.z - other.z;
 
                 const rawDistance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                const maxVoiceDistance = 5000;
+
+                const normalizedDistance = Math.min(
+                  rawDistance / maxVoiceDistance,
+                  1,
+                );
+
+                const volume = Math.pow(1 - normalizedDistance, 1.6);
 
                 return {
                   name: other.name,
                   steamId: other.steamId,
                   distance: rawDistance,
+                  volume: volume,
                 };
               },
-            );
+            )
+            .filter((player: { volume: number }) => player.volume > 0);
 
           setNearbyPlayers(others);
+
+          if (testMode && player) {
+            const fakeDistance = Math.abs(fakePlayerOffset);
+
+            const maxVoiceDistance = 5000;
+            const normalizedDistance = Math.min(
+              fakeDistance / maxVoiceDistance,
+              1,
+            );
+            const volume = Math.pow(1 - normalizedDistance, 1.6);
+
+            setNearbyPlayers([
+              ...others,
+              {
+                name: "Test Player",
+                steamId: "test-player",
+                distance: fakeDistance,
+                volume,
+              },
+            ]);
+          }
         }
       }
     };
@@ -249,10 +281,8 @@ function App() {
     });
   };
 
-  const maxDistance = 50;
-
-  const normalizedDistance = Math.min(testDistance / maxDistance, 1);
-
+  const activeTestDistance = fakePlayerOffset;
+  const normalizedDistance = Math.min(activeTestDistance / 5000, 1);
   const proximityVolume = Math.pow(1 - normalizedDistance, 1.6);
 
   useEffect(() => {
@@ -372,7 +402,8 @@ function App() {
 
       {nearbyPlayers.map((player) => (
         <div key={player.steamId} className="status">
-          {player.name}: {player.distance.toFixed(0)}
+          {player.name}: {player.distance.toFixed(0)} units |{" "}
+          {Math.round(player.volume * 100)}%
         </div>
       ))}
 
@@ -419,7 +450,9 @@ function App() {
         </label>
       </div>
 
-      <div className="panel">
+      <div className="test-panel">
+        <h2>Developer Test Tools</h2>
+
         <button onClick={toggleTestMode}>
           {testMode ? "Stop Test Mode" : "Start Test Mode"}
         </button>
@@ -427,13 +460,14 @@ function App() {
         {testMode && (
           <>
             <label>
-              Distance: {testDistance}m
+              Fake Player Distance: {fakePlayerOffset} units
               <input
                 type="range"
                 min="0"
-                max={maxDistance}
-                value={testDistance}
-                onChange={(e) => setTestDistance(Number(e.target.value))}
+                max="5000"
+                step="100"
+                value={fakePlayerOffset}
+                onChange={(e) => setFakePlayerOffset(Number(e.target.value))}
               />
             </label>
 
