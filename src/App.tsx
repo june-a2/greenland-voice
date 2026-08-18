@@ -10,52 +10,65 @@ type Device = {
 function App() {
   const [inputs, setInputs] = useState<Device[]>([]);
   const [outputs, setOutputs] = useState<Device[]>([]);
+
   const [selectedInput, setSelectedInput] = useState(
     localStorage.getItem("audioInput") || "",
   );
+
   const [selectedOutput, setSelectedOutput] = useState(
     localStorage.getItem("audioOutput") || "",
   );
 
   const [micLevel, setMicLevel] = useState(0);
   const [muted, setMuted] = useState(false);
-  const [gameRunning, setGameRunning] = useState(false);
+  const [gamePid, setGamePid] = useState<number | null>(null);
+
+  const [testMode, setTestMode] = useState(false);
+  const [testDistance, setTestDistance] = useState(10);
 
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
 
+  const testAudioRef = useRef<HTMLAudioElement | null>(null);
+
   useEffect(() => {
     const loadDevices = async () => {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
 
-      const devices = await navigator.mediaDevices.enumerateDevices();
+        const devices = await navigator.mediaDevices.enumerateDevices();
 
-      const inputDevices = devices
-        .filter((device) => device.kind === "audioinput")
-        .map((device) => ({
-          deviceId: device.deviceId,
-          label: device.label || "Microphone",
-        }));
+        const inputDevices = devices
+          .filter((device) => device.kind === "audioinput")
+          .map((device) => ({
+            deviceId: device.deviceId,
+            label: device.label || "Microphone",
+          }));
 
-      const outputDevices = devices
-        .filter((device) => device.kind === "audiooutput")
-        .map((device) => ({
-          deviceId: device.deviceId,
-          label: device.label || "Output Device",
-        }));
+        const outputDevices = devices
+          .filter((device) => device.kind === "audiooutput")
+          .map((device) => ({
+            deviceId: device.deviceId,
+            label: device.label || "Output Device",
+          }));
 
-      setInputs(inputDevices);
-      setOutputs(outputDevices);
+        setInputs(inputDevices);
+        setOutputs(outputDevices);
 
-      if (!selectedInput && inputDevices.length > 0) {
-        setSelectedInput(inputDevices[0].deviceId);
+        if (!selectedInput && inputDevices.length > 0) {
+          setSelectedInput(inputDevices[0].deviceId);
+        }
+
+        if (!selectedOutput && outputDevices.length > 0) {
+          setSelectedOutput(outputDevices[0].deviceId);
+        }
+
+        stream.getTracks().forEach((track) => track.stop());
+      } catch (error) {
+        console.error("Unable to load audio devices:", error);
       }
-
-      if (!selectedOutput && outputDevices.length > 0) {
-        setSelectedOutput(outputDevices[0].deviceId);
-      }
-
-      stream.getTracks().forEach((track) => track.stop());
     };
 
     loadDevices();
@@ -64,55 +77,71 @@ function App() {
   useEffect(() => {
     if (!selectedInput) return;
 
+    let audioContext: AudioContext | null = null;
+
     const startMic = async () => {
-      streamRef.current?.getTracks().forEach((track) => track.stop());
+      try {
+        streamRef.current?.getTracks().forEach((track) => track.stop());
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: { exact: selectedInput },
-        },
-      });
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: {
+              exact: selectedInput,
+            },
+          },
+        });
 
-      streamRef.current = stream;
+        streamRef.current = stream;
 
-      const audioContext = new AudioContext();
-      const source = audioContext.createMediaStreamSource(stream);
-      const analyser = audioContext.createAnalyser();
+        audioContext = new AudioContext();
 
-      analyser.fftSize = 256;
-      source.connect(analyser);
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
 
-      const data = new Uint8Array(analyser.frequencyBinCount);
+        analyser.fftSize = 256;
+        source.connect(analyser);
 
-      const updateLevel = () => {
-        analyser.getByteFrequencyData(data);
+        const data = new Uint8Array(analyser.frequencyBinCount);
 
-        const average =
-          data.reduce((sum, value) => sum + value, 0) / data.length;
+        const updateLevel = () => {
+          analyser.getByteFrequencyData(data);
 
-        setMicLevel(Math.min(100, average * 1.5));
+          const average =
+            data.reduce((sum, value) => sum + value, 0) / data.length;
 
-        animationRef.current = requestAnimationFrame(updateLevel);
-      };
+          setMicLevel(Math.min(100, average * 1.5));
 
-      updateLevel();
+          animationRef.current = requestAnimationFrame(updateLevel);
+        };
+
+        updateLevel();
+      } catch (error) {
+        console.error("Unable to start microphone:", error);
+      }
     };
 
     startMic();
 
     return () => {
-      if (animationRef.current) {
+      if (animationRef.current !== null) {
         cancelAnimationFrame(animationRef.current);
       }
 
       streamRef.current?.getTracks().forEach((track) => track.stop());
+
+      audioContext?.close();
     };
   }, [selectedInput]);
 
   useEffect(() => {
     const checkGame = async () => {
-      const running = await invoke<boolean>("is_the_isle_running");
-      setGameRunning(running);
+      try {
+        const pid = await invoke<number | null>("get_the_isle_pid");
+        setGamePid(pid);
+      } catch (error) {
+        console.error("Unable to detect The Isle:", error);
+        setGamePid(null);
+      }
     };
 
     checkGame();
@@ -130,16 +159,68 @@ function App() {
   const changeOutput = (deviceId: string) => {
     setSelectedOutput(deviceId);
     localStorage.setItem("audioOutput", deviceId);
+
+    if (testAudioRef.current && "setSinkId" in testAudioRef.current) {
+      testAudioRef.current.setSinkId(deviceId).catch((error) => {
+        console.error("Unable to change output device:", error);
+      });
+    }
   };
 
   const toggleMute = () => {
     const nextMuted = !muted;
+
     setMuted(nextMuted);
 
     streamRef.current?.getAudioTracks().forEach((track) => {
       track.enabled = !nextMuted;
     });
   };
+
+  const proximityVolume = Math.max(0, 1 - testDistance / 50);
+
+  const toggleTestMode = async () => {
+    if (!testMode) {
+      if (!streamRef.current) return;
+
+      const audio = new Audio();
+      audio.srcObject = streamRef.current;
+      audio.volume = proximityVolume;
+
+      if ("setSinkId" in audio && selectedOutput) {
+        try {
+          await audio.setSinkId(selectedOutput);
+        } catch (error) {
+          console.error("Unable to set test output device:", error);
+        }
+      }
+
+      try {
+        await audio.play();
+        testAudioRef.current = audio;
+        setTestMode(true);
+      } catch (error) {
+        console.error("Unable to start test audio:", error);
+      }
+    } else {
+      testAudioRef.current?.pause();
+      testAudioRef.current = null;
+      setTestMode(false);
+    }
+  };
+
+  useEffect(() => {
+    if (testAudioRef.current) {
+      testAudioRef.current.volume = proximityVolume;
+    }
+  }, [proximityVolume]);
+
+  useEffect(() => {
+    return () => {
+      testAudioRef.current?.pause();
+      testAudioRef.current = null;
+    };
+  }, []);
 
   return (
     <main className="app">
@@ -151,8 +232,8 @@ function App() {
       </div>
 
       <div className="status">
-        <span className={`dot ${gameRunning ? "online" : ""}`} />
-        The Isle: {gameRunning ? "Detected" : "Not Running"}
+        <span className={`dot ${gamePid ? "online" : ""}`} />
+        The Isle: {gamePid ? `Detected (${gamePid})` : "Not Running"}
       </div>
 
       <div className="panel">
@@ -171,7 +252,12 @@ function App() {
         </label>
 
         <div className="meter">
-          <div className="meter-fill" style={{ width: `${micLevel}%` }} />
+          <div
+            className="meter-fill"
+            style={{
+              width: `${micLevel}%`,
+            }}
+          />
         </div>
 
         <button onClick={toggleMute}>
@@ -191,6 +277,29 @@ function App() {
             ))}
           </select>
         </label>
+      </div>
+
+      <div className="panel">
+        <button onClick={toggleTestMode}>
+          {testMode ? "Stop Test Mode" : "Start Test Mode"}
+        </button>
+
+        {testMode && (
+          <>
+            <label>
+              Test Player Distance: {testDistance}m
+              <input
+                type="range"
+                min="0"
+                max="50"
+                value={testDistance}
+                onChange={(e) => setTestDistance(Number(e.target.value))}
+              />
+            </label>
+
+            <div>Simulated Volume: {Math.round(proximityVolume * 100)}%</div>
+          </>
+        )}
       </div>
 
       <button className="connect">Connect</button>
