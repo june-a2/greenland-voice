@@ -22,7 +22,19 @@ function App() {
   const [micLevel, setMicLevel] = useState(0);
   const [muted, setMuted] = useState(false);
   const [gamePid, setGamePid] = useState<number | null>(null);
-
+  const [playerPosition, setPlayerPosition] = useState<{
+    x: number;
+    y: number;
+    z: number;
+  } | null>(null);
+  const [nearbyPlayers, setNearbyPlayers] = useState<
+    {
+      name: string;
+      steamId: string;
+      distance: number;
+    }[]
+  >([]);
+  const STEAM_ID = "76561199083876638";
   const [testMode, setTestMode] = useState(false);
   const [testDistance, setTestDistance] = useState(10);
   const [testPan, setTestPan] = useState(0);
@@ -157,6 +169,58 @@ function App() {
     const interval = setInterval(checkGame, 3000);
 
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const socket = new WebSocket("ws://localhost:8787");
+
+    socket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+
+      if (data.type === "players" && data.players.length > 0) {
+        const player = data.players.find(
+          (player: { steamId: string }) => player.steamId === STEAM_ID,
+        );
+
+        if (player) {
+          setPlayerPosition({
+            x: player.x,
+            y: player.y,
+            z: player.z,
+          });
+
+          const others = data.players
+            .filter((other: { steamId: string }) => other.steamId !== STEAM_ID)
+            .map(
+              (other: {
+                name: string;
+                steamId: string;
+                x: number;
+                y: number;
+                z: number;
+              }) => {
+                const dx = player.x - other.x;
+                const dy = player.y - other.y;
+                const dz = player.z - other.z;
+
+                const rawDistance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+                return {
+                  name: other.name,
+                  steamId: other.steamId,
+                  distance: rawDistance,
+                };
+              },
+            );
+
+          setNearbyPlayers(others);
+        }
+      }
+    };
+
+    return () => {
+      socket.close();
+    };
   }, []);
 
   const changeInput = (deviceId: string) => {
@@ -298,6 +362,19 @@ function App() {
         <span className={`dot ${gamePid ? "online" : ""}`} />
         The Isle: {gamePid ? `Detected (${gamePid})` : "Not Running"}
       </div>
+
+      {playerPosition && (
+        <div className="status">
+          X: {playerPosition.x.toFixed(0)} | Y: {playerPosition.y.toFixed(0)} |
+          Z: {playerPosition.z.toFixed(0)}
+        </div>
+      )}
+
+      {nearbyPlayers.map((player) => (
+        <div key={player.steamId} className="status">
+          {player.name}: {player.distance.toFixed(0)}
+        </div>
+      ))}
 
       <div className="panel">
         <label>
