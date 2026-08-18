@@ -1,49 +1,81 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useState } from "react";
 import "./App.css";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+type Device = {
+  deviceId: string;
+  label: string;
+};
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+function App() {
+  const [inputs, setInputs] = useState<Device[]>([]);
+  const [outputs, setOutputs] = useState<Device[]>([]);
+
+  useEffect(() => {
+    const loadDevices = async () => {
+      try {
+        await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        const devices = await navigator.mediaDevices.enumerateDevices();
+
+        setInputs(
+          devices
+            .filter((device) => device.kind === "audioinput")
+            .map((device) => ({
+              deviceId: device.deviceId,
+              label: device.label || "Microphone",
+            })),
+        );
+
+        setOutputs(
+          devices
+            .filter((device) => device.kind === "audiooutput")
+            .map((device) => ({
+              deviceId: device.deviceId,
+              label: device.label || "Output Device",
+            })),
+        );
+      } catch (error) {
+        console.error("Unable to load audio devices:", error);
+      }
+    };
+
+    loadDevices();
+  }, []);
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
+    <main className="app">
+      <h1>GREENLAND VOICE</h1>
 
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
+      <div className="status">
+        <span className="dot" />
+        Disconnected
       </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
 
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
+      <div className="panel">
+        <label>
+          Microphone
+          <select>
+            {inputs.map((device) => (
+              <option key={device.deviceId} value={device.deviceId}>
+                {device.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label>
+          Output
+          <select>
+            {outputs.map((device) => (
+              <option key={device.deviceId} value={device.deviceId}>
+                {device.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      <button className="connect">Connect</button>
     </main>
   );
 }
