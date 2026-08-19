@@ -4,8 +4,6 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { listen } from "@tauri-apps/api/event";
 
-import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
-
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import {
@@ -205,42 +203,6 @@ function DeviceDropdown({
   );
 }
 
-function formatKeyName(key: string) {
-  if (key === " ") {
-    return "Space";
-  }
-
-  if (key === "Control") {
-    return "Ctrl";
-  }
-
-  if (key === "Escape") {
-    return "Esc";
-  }
-
-  if (key === "ArrowUp") {
-    return "Up";
-  }
-
-  if (key === "ArrowDown") {
-    return "Down";
-  }
-
-  if (key === "ArrowLeft") {
-    return "Left";
-  }
-
-  if (key === "ArrowRight") {
-    return "Right";
-  }
-
-  if (key.length === 1) {
-    return key.toUpperCase();
-  }
-
-  return key;
-}
-
 function loadPttBinding(): PttBinding {
   const saved = localStorage.getItem("pttBinding");
 
@@ -272,6 +234,21 @@ function loadPttBinding(): PttBinding {
 
     value: "V",
   };
+}
+
+function formatPttKey(key: string) {
+  if (key === " ") return "Space";
+  if (key === "Control") return "Ctrl";
+  if (key === "Escape") return "Escape";
+  if (key === "ArrowUp") return "Up";
+  if (key === "ArrowDown") return "Down";
+  if (key === "ArrowLeft") return "Left";
+  if (key === "ArrowRight") return "Right";
+  if (key === "PageUp") return "PageUp";
+  if (key === "PageDown") return "PageDown";
+  if (key === "CapsLock") return "CapsLock";
+  if (key.length === 1) return key.toUpperCase();
+  return key;
 }
 
 function App() {
@@ -358,6 +335,8 @@ function App() {
   const pttBindingRef = useRef<PttBinding>(pttBinding);
 
   const listeningForPttRef = useRef(listeningForPttKey);
+
+  const pttPressedRef = useRef(false);
 
   const micTestContextRef = useRef<AudioContext | null>(null);
 
@@ -979,19 +958,19 @@ function App() {
       }
 
       if (event.key === "Escape") {
+        listeningForPttRef.current = false;
         setListeningForPttKey(false);
-
         return;
       }
 
-      const key = formatKeyName(event.key);
+      const value = formatPttKey(event.key);
 
       savePttBinding({
         type: "keyboard",
-
-        value: key,
+        value,
       });
 
+      listeningForPttRef.current = false;
       setListeningForPttKey(false);
     };
 
@@ -1003,26 +982,51 @@ function App() {
   }, [listeningForPttKey]);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    const keyboardKey =
+      voiceMode === "ptt" && pttBinding.type === "keyboard"
+        ? pttBinding.value
+        : null;
 
-    listen<string>("ptt-mouse", (event) => {
-      const [button, state] = event.payload.split(":");
+    invoke("set_ptt_keyboard_key", { key: keyboardKey }).catch((error) => {
+      console.error("Unable to configure keyboard Push to Talk:", error);
 
-      if (button !== "Mouse4" && button !== "Mouse5") {
+      if (keyboardKey) {
+        showToast(
+          "error",
+          "Push to Talk unavailable",
+          `The ${keyboardKey} key isn't supported for Push to Talk.`,
+        );
+      }
+    });
+
+    return () => {
+      void invoke("set_ptt_keyboard_key", { key: null });
+    };
+  }, [voiceMode, pttBinding]);
+
+  useEffect(() => {
+    let unlistenKeyboard: (() => void) | undefined;
+    let unlistenMouse: (() => void) | undefined;
+
+    const handlePttState = (type: PttBinding["type"], payload: string) => {
+      const [value, state] = payload.split(":");
+
+      if (!value || (state !== "pressed" && state !== "released")) {
         return;
       }
 
-      if (listeningForPttRef.current) {
-        if (state === "pressed") {
-          savePttBinding({
-            type: "mouse",
-
-            value: button,
-          });
-
-          setListeningForPttKey(false);
+      if (type === "mouse" && listeningForPttRef.current) {
+        if (state !== "pressed") {
+          return;
         }
 
+        savePttBinding({
+          type: "mouse",
+          value,
+        });
+
+        listeningForPttRef.current = false;
+        setListeningForPttKey(false);
         return;
       }
 
@@ -1030,95 +1034,54 @@ function App() {
 
       if (
         voiceModeRef.current !== "ptt" ||
-        binding.type !== "mouse" ||
-        binding.value !== button
+        binding.type !== type ||
+        binding.value !== value
       ) {
         return;
       }
 
       if (state === "pressed") {
+        if (pttPressedRef.current) {
+          return;
+        }
+
+        pttPressedRef.current = true;
+
         if (mutedRef.current || micTestActiveRef.current || !roomRef.current) {
           return;
         }
 
         void setLiveKitMic(true);
-
         return;
       }
 
-      if (state === "released") {
-        void setLiveKitMic(false);
+      if (!pttPressedRef.current) {
+        return;
       }
+
+      pttPressedRef.current = false;
+      void setLiveKitMic(false);
+    };
+
+    listen<string>("ptt-keyboard", (event) => {
+      handlePttState("keyboard", event.payload);
     }).then((stop) => {
-      unlisten = stop;
+      unlistenKeyboard = stop;
+    });
+
+    listen<string>("ptt-mouse", (event) => {
+      handlePttState("mouse", event.payload);
+    }).then((stop) => {
+      unlistenMouse = stop;
     });
 
     return () => {
-      unlisten?.();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (
-      voiceMode !== "ptt" ||
-      listeningForPttKey ||
-      pttBinding.type !== "keyboard"
-    ) {
-      return;
-    }
-
-    let active = true;
-
-    const shortcut = pttBinding.value;
-
-    const setupShortcut = async () => {
-      try {
-        try {
-          await unregister(shortcut);
-        } catch {}
-
-        await register(shortcut, (event) => {
-          if (!active) {
-            return;
-          }
-
-          if (event.state === "Pressed") {
-            if (
-              mutedRef.current ||
-              micTestActiveRef.current ||
-              !roomRef.current
-            ) {
-              return;
-            }
-
-            void setLiveKitMic(true);
-          }
-
-          if (event.state === "Released") {
-            void setLiveKitMic(false);
-          }
-        });
-      } catch (error) {
-        console.error("Unable to register Push to Talk:", error);
-
-        showToast(
-          "error",
-          "Push to Talk unavailable",
-          `The ${shortcut} key couldn't be registered. Choose a different PTT key.`,
-        );
-      }
-    };
-
-    setupShortcut();
-
-    return () => {
-      active = false;
-
-      unregister(shortcut).catch(() => {});
-
+      unlistenKeyboard?.();
+      unlistenMouse?.();
+      pttPressedRef.current = false;
       void setLiveKitMic(false);
     };
-  }, [voiceMode, pttBinding, listeningForPttKey]);
+  }, []);
 
   const startVoiceConnection = async () => {
     if (
@@ -1598,10 +1561,6 @@ function App() {
 
       if (micTestContextRef.current) {
         micTestContextRef.current.close();
-      }
-
-      if (pttBindingRef.current.type === "keyboard") {
-        unregister(pttBindingRef.current.value).catch(() => {});
       }
 
       cleanupRemoteAudio();
