@@ -2131,12 +2131,10 @@ function App() {
     <main className="app">
       <header className="topbar">
         <div className="brand">
-          <div className="brand-logo">G</div>
-
           <div>
             <div className="brand-title">Greenland Voice</div>
 
-            <div className="brand-subtitle">v.1.0.0</div>
+            <div className="brand-subtitle"> v.1.0.0</div>
           </div>
         </div>
 
