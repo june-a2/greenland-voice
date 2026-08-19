@@ -1,6 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Room, RoomEvent, Track } from "livekit-client";
+
+import "@fontsource/poppins/400.css";
+import "@fontsource/poppins/500.css";
+import "@fontsource/poppins/600.css";
+import "@fontsource/poppins/700.css";
+
 import "./App.css";
 
 type Device = {
@@ -11,9 +19,40 @@ type Device = {
 type NearbyPlayer = {
   name: string;
   steamId: string;
-  distance: number;
   volume: number;
 };
+
+type VoiceMode = "open" | "ptt";
+
+type TooltipProps = {
+  title: string;
+  body: string;
+};
+
+type SnapshotMessage = {
+  type: "snapshot";
+  self: {
+    x: number;
+    y: number;
+    z: number;
+  } | null;
+  nearby: NearbyPlayer[];
+};
+
+const API_URL = "https://greenland-voice.onrender.com";
+const WS_URL = "wss://greenland-voice.onrender.com/ws";
+
+const SUPPORT_URL =
+  "https://discord.com/channels/YOUR_SERVER_ID/YOUR_CHANNEL_ID";
+
+function Tooltip({ title, body }: TooltipProps) {
+  return (
+    <div className="tooltip">
+      <strong>{title}</strong>
+      <span>{body}</span>
+    </div>
+  );
+}
 
 function App() {
   const [inputs, setInputs] = useState<Device[]>([]);
@@ -27,12 +66,20 @@ function App() {
     localStorage.getItem("audioOutput") || "",
   );
 
+  const [voiceMode, setVoiceMode] = useState<VoiceMode>(
+    (localStorage.getItem("voiceMode") as VoiceMode) || "open",
+  );
+
   const [micLevel, setMicLevel] = useState(0);
   const [muted, setMuted] = useState(false);
+  const [micTestActive, setMicTestActive] = useState(false);
+  const [isTransmitting, setIsTransmitting] = useState(false);
+
   const [gamePid, setGamePid] = useState<number | null>(null);
-  const [backendConnected, setBackendConnected] = useState(false);
+
   const [voiceConnected, setVoiceConnected] = useState(false);
   const [voiceConnecting, setVoiceConnecting] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
 
   const [playerPosition, setPlayerPosition] = useState<{
     x: number;
@@ -44,9 +91,12 @@ function App() {
 
   const [steamId, setSteamId] = useState<string | null>(null);
 
-  const [testMode, setTestMode] = useState(false);
-  const [testPan, setTestPan] = useState(0);
-  const [fakePlayerOffset, setFakePlayerOffset] = useState(1000);
+  const [steamVerified, setSteamVerified] = useState(false);
+  const [steamVerifying, setSteamVerifying] = useState(false);
+
+  const [sessionToken, setSessionToken] = useState<string | null>(
+    localStorage.getItem("greenlandSession"),
+  );
 
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
@@ -55,17 +105,20 @@ function App() {
 
   const remoteAudioRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const nearbyPlayersRef = useRef<NearbyPlayer[]>([]);
+
   const selectedOutputRef = useRef(selectedOutput);
 
-  const testAudioContextRef = useRef<AudioContext | null>(null);
-  const testSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const testGainRef = useRef<GainNode | null>(null);
-  const testPannerRef = useRef<StereoPannerNode | null>(null);
-  const testDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(
+  const mutedRef = useRef(muted);
+  const voiceModeRef = useRef<VoiceMode>(voiceMode);
+  const micTestActiveRef = useRef(micTestActive);
+
+  const micTestContextRef = useRef<AudioContext | null>(null);
+  const micTestSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const micTestDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(
     null,
   );
 
-  const testAudioRef = useRef<HTMLAudioElement | null>(null);
+  const micTestAudioRef = useRef<HTMLAudioElement | null>(null);
 
   const applyRemoteVolumes = () => {
     const nearby = nearbyPlayersRef.current;
@@ -86,6 +139,46 @@ function App() {
 
     remoteAudioRef.current.clear();
   };
+
+  const clearSession = () => {
+    localStorage.removeItem("greenlandSession");
+
+    setSessionToken(null);
+    setSteamVerified(false);
+  };
+
+  const setLiveKitMic = async (enabled: boolean) => {
+    const room = roomRef.current;
+
+    if (!room) {
+      setIsTransmitting(false);
+      return;
+    }
+
+    try {
+      await room.localParticipant.setMicrophoneEnabled(enabled);
+      setIsTransmitting(enabled);
+    } catch (error) {
+      console.error("Unable to change microphone state:", error);
+      setIsTransmitting(false);
+    }
+  };
+
+  useEffect(() => {
+    mutedRef.current = muted;
+  }, [muted]);
+
+  useEffect(() => {
+    voiceModeRef.current = voiceMode;
+  }, [voiceMode]);
+
+  useEffect(() => {
+    micTestActiveRef.current = micTestActive;
+  }, [micTestActive]);
+
+  useEffect(() => {
+    selectedOutputRef.current = selectedOutput;
+  }, [selectedOutput]);
 
   useEffect(() => {
     const loadDevices = async () => {
@@ -155,6 +248,7 @@ function App() {
         const analyser = audioContext.createAnalyser();
 
         analyser.fftSize = 256;
+
         source.connect(analyser);
 
         const data = new Uint8Array(analyser.frequencyBinCount);
@@ -193,9 +287,11 @@ function App() {
     const checkGame = async () => {
       try {
         const pid = await invoke<number | null>("get_the_isle_pid");
+
         setGamePid(pid);
       } catch (error) {
         console.error("Unable to detect The Isle:", error);
+
         setGamePid(null);
       }
     };
@@ -204,7 +300,6 @@ function App() {
 
     invoke<string | null>("get_steam_id")
       .then((detectedSteamId) => {
-        console.log("Detected SteamID:", detectedSteamId);
         setSteamId(detectedSteamId);
       })
       .catch((error) => {
@@ -217,119 +312,201 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!steamId) return;
+    if (!sessionToken || !steamId) {
+      setSteamVerified(false);
+
+      return;
+    }
+
+    const validateSession = async () => {
+      try {
+        const response = await fetch(`${API_URL}/auth/me`, {
+          headers: {
+            Authorization: `Bearer ${sessionToken}`,
+          },
+        });
+
+        if (!response.ok) {
+          clearSession();
+
+          return;
+        }
+
+        const data = (await response.json()) as {
+          authenticated: boolean;
+          steamId?: string;
+        };
+
+        if (!data.authenticated || !data.steamId || data.steamId !== steamId) {
+          clearSession();
+
+          return;
+        }
+
+        setSteamVerified(true);
+      } catch (error) {
+        console.error("Unable to validate Steam session:", error);
+      }
+    };
+
+    validateSession();
+  }, [sessionToken, steamId]);
+
+  const verifySteam = async () => {
+    if (!steamId || steamVerifying) return;
+
+    try {
+      setSteamVerifying(true);
+
+      const response = await fetch(
+        `${API_URL}/auth/steam/start?steamId=${encodeURIComponent(steamId)}`,
+      );
+
+      if (!response.ok) {
+        throw new Error("Unable to start Steam verification");
+      }
+
+      const data = (await response.json()) as {
+        authId: string;
+        url: string;
+      };
+
+      await openUrl(data.url);
+
+      const startedAt = Date.now();
+      const timeout = 5 * 60 * 1000;
+
+      while (Date.now() - startedAt < timeout) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1500));
+
+        const statusResponse = await fetch(
+          `${API_URL}/auth/steam/status?authId=${encodeURIComponent(
+            data.authId,
+          )}`,
+        );
+
+        if (statusResponse.status === 404) {
+          throw new Error("Steam verification expired");
+        }
+
+        if (!statusResponse.ok) {
+          continue;
+        }
+
+        const status = (await statusResponse.json()) as {
+          status: string;
+          token?: string;
+          steamId?: string;
+        };
+
+        if (status.status !== "verified") {
+          continue;
+        }
+
+        if (!status.token || status.steamId !== steamId) {
+          throw new Error("Verified Steam account does not match");
+        }
+
+        localStorage.setItem("greenlandSession", status.token);
+
+        setSessionToken(status.token);
+        setSteamVerified(true);
+
+        return;
+      }
+
+      throw new Error("Steam verification timed out");
+    } catch (error) {
+      console.error("Steam verification failed:", error);
+    } finally {
+      setSteamVerifying(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!steamId || !sessionToken || !steamVerified) {
+      nearbyPlayersRef.current = [];
+
+      setNearbyPlayers([]);
+      setPlayerPosition(null);
+
+      applyRemoteVolumes();
+
+      return;
+    }
 
     let socket: WebSocket | null = null;
     let reconnectTimer: number | null = null;
     let stopped = false;
 
-    const connectBackend = () => {
-      socket = new WebSocket("wss://greenland-voice.onrender.com/ws");
+    const connectSocket = () => {
+      socket = new WebSocket(WS_URL);
 
       socket.onopen = () => {
-        console.log("Connected to Greenland backend");
-        setBackendConnected(true);
-      };
-
-      socket.onerror = (error) => {
-        console.error("Greenland backend WebSocket error:", error);
-      };
-
-      socket.onclose = () => {
-        console.log("Disconnected from Greenland backend");
-        setBackendConnected(false);
-
-        if (!stopped) {
-          reconnectTimer = window.setTimeout(() => {
-            console.log("Reconnecting to Greenland backend...");
-            connectBackend();
-          }, 3000);
-        }
+        socket?.send(
+          JSON.stringify({
+            type: "auth",
+            token: sessionToken,
+          }),
+        );
       };
 
       socket.onmessage = (event) => {
-        const data = JSON.parse(event.data);
+        try {
+          const data = JSON.parse(event.data);
 
-        if (data.type === "players" && data.players.length > 0) {
-          const player = data.players.find(
-            (player: { steamId: string }) => player.steamId === steamId,
-          );
-
-          if (player) {
-            const x = Number(player.x);
-            const y = Number(player.y);
-            const z = Number(player.z);
-
-            setPlayerPosition({
-              x,
-              y,
-              z,
-            });
-
-            const others: NearbyPlayer[] = data.players
-              .filter((other: { steamId: string }) => other.steamId !== steamId)
-              .map(
-                (other: {
-                  name: string;
-                  steamId: string;
-                  x: number;
-                  y: number;
-                  z: number;
-                }) => {
-                  const dx = x - Number(other.x);
-                  const dy = y - Number(other.y);
-                  const dz = z - Number(other.z);
-
-                  const rawDistance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-                  const maxVoiceDistance = 5000;
-
-                  const normalizedDistance = Math.min(
-                    rawDistance / maxVoiceDistance,
-                    1,
-                  );
-
-                  const volume = Math.pow(1 - normalizedDistance, 1.6);
-
-                  return {
-                    name: other.name,
-                    steamId: other.steamId,
-                    distance: rawDistance,
-                    volume,
-                  };
-                },
-              )
-              .filter((player: NearbyPlayer) => player.volume > 0);
-
-            nearbyPlayersRef.current = others;
-
-            if (testMode) {
-              const fakeDistance = Math.abs(fakePlayerOffset);
-
-              const normalizedDistance = Math.min(fakeDistance / 5000, 1);
-
-              const volume = Math.pow(1 - normalizedDistance, 1.6);
-
-              setNearbyPlayers([
-                ...others,
-                {
-                  name: "Test Player",
-                  steamId: "test-player",
-                  distance: fakeDistance,
-                  volume,
-                },
-              ]);
-            } else {
-              setNearbyPlayers(others);
-            }
-
-            applyRemoteVolumes();
+          if (data.type === "authenticated") {
+            return;
           }
+
+          if (data.type !== "snapshot") {
+            return;
+          }
+
+          const snapshot = data as SnapshotMessage;
+
+          if (snapshot.self) {
+            setPlayerPosition({
+              x: Number(snapshot.self.x),
+              y: Number(snapshot.self.y),
+              z: Number(snapshot.self.z),
+            });
+          } else {
+            setPlayerPosition(null);
+          }
+
+          const nearby = snapshot.nearby || [];
+
+          nearbyPlayersRef.current = nearby;
+
+          setNearbyPlayers(nearby);
+
+          applyRemoteVolumes();
+        } catch (error) {
+          console.error("Invalid backend message:", error);
+        }
+      };
+
+      socket.onerror = (error) => {
+        console.error("Greenland WebSocket error:", error);
+      };
+
+      socket.onclose = (event) => {
+        if (event.code === 4001) {
+          clearSession();
+
+          return;
+        }
+
+        if (!stopped) {
+          reconnectTimer = window.setTimeout(() => {
+            connectSocket();
+          }, 3000);
         }
       };
     };
 
-    connectBackend();
+    connectSocket();
 
     return () => {
       stopped = true;
@@ -340,175 +517,225 @@ function App() {
 
       socket?.close();
     };
-  }, [steamId]);
+  }, [steamId, sessionToken, steamVerified]);
 
   useEffect(() => {
-    nearbyPlayersRef.current = nearbyPlayers.filter(
-      (player) => player.steamId !== "test-player",
-    );
+    nearbyPlayersRef.current = nearbyPlayers;
 
     applyRemoteVolumes();
   }, [nearbyPlayers]);
 
   useEffect(() => {
-    selectedOutputRef.current = selectedOutput;
-  }, [selectedOutput]);
+    if (voiceMode !== "ptt") return;
 
-  const connectVoice = async () => {
-    if (!steamId) {
-      console.error("Cannot connect voice: SteamID missing");
+    let active = true;
+
+    const setupShortcut = async () => {
+      try {
+        try {
+          await unregister("V");
+        } catch {}
+
+        await register("V", (event) => {
+          if (!active) return;
+
+          if (event.state === "Pressed") {
+            if (
+              mutedRef.current ||
+              micTestActiveRef.current ||
+              !roomRef.current
+            ) {
+              return;
+            }
+
+            void setLiveKitMic(true);
+          }
+
+          if (event.state === "Released") {
+            void setLiveKitMic(false);
+          }
+        });
+      } catch (error) {
+        console.error("Unable to register Push to Talk:", error);
+      }
+    };
+
+    setupShortcut();
+
+    return () => {
+      active = false;
+
+      unregister("V").catch(() => {});
+
+      if (voiceModeRef.current === "ptt") {
+        void setLiveKitMic(false);
+      }
+    };
+  }, [voiceMode]);
+
+  const startVoiceConnection = async () => {
+    if (!steamId || !steamVerified || !sessionToken) {
       return;
     }
 
-    if (voiceConnecting) return;
+    const response = await fetch(`${API_URL}/livekit-token`, {
+      headers: {
+        Authorization: `Bearer ${sessionToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        clearSession();
+      }
+
+      const error = await response.text();
+
+      throw new Error(`Token request failed: ${response.status} ${error}`);
+    }
+
+    const data = (await response.json()) as {
+      serverUrl: string;
+      token: string;
+    };
+
+    const room = new Room();
+
+    room.on(RoomEvent.Connected, () => {
+      setVoiceConnected(true);
+    });
+
+    room.on(RoomEvent.Disconnected, () => {
+      cleanupRemoteAudio();
+
+      setVoiceConnected(false);
+      setIsTransmitting(false);
+
+      if (roomRef.current === room) {
+        roomRef.current = null;
+      }
+    });
+
+    room.on(RoomEvent.MediaDevicesError, (error) => {
+      console.error("LiveKit media device error:", error);
+    });
+
+    room.on(
+      RoomEvent.TrackSubscribed,
+      async (track, _publication, participant) => {
+        if (track.kind !== Track.Kind.Audio) {
+          return;
+        }
+
+        const remoteSteamId = participant.identity;
+
+        const existingAudio = remoteAudioRef.current.get(remoteSteamId);
+
+        if (existingAudio) {
+          existingAudio.pause();
+          existingAudio.srcObject = null;
+          existingAudio.remove();
+        }
+
+        const element = track.attach();
+
+        if (!(element instanceof HTMLAudioElement)) {
+          return;
+        }
+
+        element.autoplay = true;
+        element.volume = 0;
+        element.style.display = "none";
+
+        const outputDevice = selectedOutputRef.current;
+
+        if (outputDevice && "setSinkId" in element) {
+          try {
+            await element.setSinkId(outputDevice);
+          } catch (error) {
+            console.error("Unable to route remote voice output:", error);
+          }
+        }
+
+        document.body.appendChild(element);
+
+        remoteAudioRef.current.set(remoteSteamId, element);
+
+        applyRemoteVolumes();
+
+        try {
+          await element.play();
+        } catch (error) {
+          console.warn("Remote voice playback could not start:", error);
+        }
+      },
+    );
+
+    room.on(RoomEvent.TrackUnsubscribed, (track, _publication, participant) => {
+      if (track.kind !== Track.Kind.Audio) {
+        return;
+      }
+
+      const remoteSteamId = participant.identity;
+
+      const element = remoteAudioRef.current.get(remoteSteamId);
+
+      if (element) {
+        element.pause();
+        element.srcObject = null;
+        element.remove();
+
+        remoteAudioRef.current.delete(remoteSteamId);
+      }
+
+      track.detach();
+    });
+
+    roomRef.current = room;
+
+    await room.connect(data.serverUrl, data.token);
+
+    if (selectedInput) {
+      await room.switchActiveDevice("audioinput", selectedInput);
+    }
+
+    const shouldTransmit =
+      voiceModeRef.current === "open" &&
+      !mutedRef.current &&
+      !micTestActiveRef.current;
+
+    await setLiveKitMic(shouldTransmit);
+
+    try {
+      await room.startAudio();
+    } catch (error) {
+      console.warn("LiveKit audio playback could not start:", error);
+    }
+  };
+
+  const connectVoice = async () => {
+    if (!steamId || !steamVerified || !sessionToken || voiceConnecting) {
+      return;
+    }
 
     if (roomRef.current) {
+      await setLiveKitMic(false);
+
       roomRef.current.disconnect();
       roomRef.current = null;
 
       cleanupRemoteAudio();
 
       setVoiceConnected(false);
+      setIsTransmitting(false);
+
       return;
     }
 
     try {
       setVoiceConnecting(true);
 
-      const response = await fetch(
-        `https://greenland-voice.onrender.com/livekit-token?steamId=${encodeURIComponent(
-          steamId,
-        )}`,
-      );
-
-      if (!response.ok) {
-        const error = await response.text();
-
-        throw new Error(`Token request failed: ${response.status} ${error}`);
-      }
-
-      const data = (await response.json()) as {
-        serverUrl: string;
-        token: string;
-      };
-
-      const room = new Room();
-
-      room.on(RoomEvent.Connected, () => {
-        console.log("Connected to Greenland voice");
-        setVoiceConnected(true);
-      });
-
-      room.on(RoomEvent.Disconnected, () => {
-        console.log("Disconnected from Greenland voice");
-
-        cleanupRemoteAudio();
-
-        setVoiceConnected(false);
-        roomRef.current = null;
-      });
-
-      room.on(RoomEvent.MediaDevicesError, (error) => {
-        console.error("LiveKit media device error:", error);
-      });
-
-      room.on(
-        RoomEvent.TrackSubscribed,
-        async (track, _publication, participant) => {
-          if (track.kind !== Track.Kind.Audio) {
-            return;
-          }
-
-          const remoteSteamId = participant.identity;
-
-          console.log(
-            `Remote voice subscribed: ${participant.name || remoteSteamId}`,
-          );
-
-          const existingAudio = remoteAudioRef.current.get(remoteSteamId);
-
-          if (existingAudio) {
-            existingAudio.pause();
-            existingAudio.srcObject = null;
-            existingAudio.remove();
-          }
-
-          const element = track.attach();
-
-          if (!(element instanceof HTMLAudioElement)) {
-            return;
-          }
-
-          element.autoplay = true;
-          element.volume = 0;
-          element.style.display = "none";
-
-          const outputDevice = selectedOutputRef.current;
-
-          if (outputDevice && "setSinkId" in element) {
-            try {
-              await element.setSinkId(outputDevice);
-            } catch (error) {
-              console.error("Unable to route remote voice output:", error);
-            }
-          }
-
-          document.body.appendChild(element);
-
-          remoteAudioRef.current.set(remoteSteamId, element);
-
-          applyRemoteVolumes();
-
-          try {
-            await element.play();
-          } catch (error) {
-            console.warn("Remote voice playback could not start:", error);
-          }
-        },
-      );
-
-      room.on(
-        RoomEvent.TrackUnsubscribed,
-        (track, _publication, participant) => {
-          if (track.kind !== Track.Kind.Audio) {
-            return;
-          }
-
-          const remoteSteamId = participant.identity;
-
-          console.log(
-            `Remote voice unsubscribed: ${participant.name || remoteSteamId}`,
-          );
-
-          const element = remoteAudioRef.current.get(remoteSteamId);
-
-          if (element) {
-            element.pause();
-            element.srcObject = null;
-            element.remove();
-
-            remoteAudioRef.current.delete(remoteSteamId);
-          }
-
-          track.detach();
-        },
-      );
-
-      roomRef.current = room;
-
-      await room.connect(data.serverUrl, data.token);
-
-      if (selectedInput) {
-        await room.switchActiveDevice("audioinput", selectedInput);
-      }
-
-      await room.localParticipant.setMicrophoneEnabled(!muted);
-
-      try {
-        await room.startAudio();
-      } catch (error) {
-        console.warn("LiveKit audio playback could not start:", error);
-      }
+      await startVoiceConnection();
     } catch (error) {
       console.error("Unable to connect to Greenland voice:", error);
 
@@ -518,13 +745,158 @@ function App() {
       cleanupRemoteAudio();
 
       setVoiceConnected(false);
+      setIsTransmitting(false);
     } finally {
       setVoiceConnecting(false);
     }
   };
 
+  const reconnectVoice = async () => {
+    if (!steamId || !steamVerified || !sessionToken || reconnecting) {
+      return;
+    }
+
+    try {
+      setReconnecting(true);
+
+      await setLiveKitMic(false);
+
+      roomRef.current?.disconnect();
+      roomRef.current = null;
+
+      cleanupRemoteAudio();
+
+      setVoiceConnected(false);
+      setIsTransmitting(false);
+
+      await startVoiceConnection();
+    } catch (error) {
+      console.error("Unable to reconnect voice:", error);
+
+      roomRef.current?.disconnect();
+      roomRef.current = null;
+
+      cleanupRemoteAudio();
+
+      setVoiceConnected(false);
+      setIsTransmitting(false);
+    } finally {
+      setReconnecting(false);
+    }
+  };
+
+  const changeVoiceMode = async (mode: VoiceMode) => {
+    setVoiceMode(mode);
+    voiceModeRef.current = mode;
+
+    localStorage.setItem("voiceMode", mode);
+
+    if (!roomRef.current) {
+      setIsTransmitting(false);
+
+      return;
+    }
+
+    if (mutedRef.current || micTestActiveRef.current) {
+      await setLiveKitMic(false);
+
+      return;
+    }
+
+    await setLiveKitMic(mode === "open");
+  };
+
+  const stopMicTest = async () => {
+    micTestAudioRef.current?.pause();
+
+    if (micTestAudioRef.current) {
+      micTestAudioRef.current.srcObject = null;
+    }
+
+    micTestAudioRef.current = null;
+
+    micTestSourceRef.current?.disconnect();
+    micTestSourceRef.current = null;
+
+    micTestDestinationRef.current?.disconnect();
+    micTestDestinationRef.current = null;
+
+    if (micTestContextRef.current) {
+      await micTestContextRef.current.close();
+
+      micTestContextRef.current = null;
+    }
+
+    setMicTestActive(false);
+    micTestActiveRef.current = false;
+
+    if (
+      roomRef.current &&
+      voiceModeRef.current === "open" &&
+      !mutedRef.current
+    ) {
+      await setLiveKitMic(true);
+    } else {
+      await setLiveKitMic(false);
+    }
+  };
+
+  const startMicTest = async () => {
+    if (!streamRef.current) return;
+
+    try {
+      micTestActiveRef.current = true;
+
+      setMicTestActive(true);
+
+      await setLiveKitMic(false);
+
+      const context = new AudioContext();
+
+      const source = context.createMediaStreamSource(streamRef.current);
+
+      const destination = context.createMediaStreamDestination();
+
+      source.connect(destination);
+
+      const audio = new Audio();
+
+      audio.srcObject = destination.stream;
+
+      if (selectedOutputRef.current && "setSinkId" in audio) {
+        await audio.setSinkId(selectedOutputRef.current);
+      }
+
+      await audio.play();
+
+      micTestContextRef.current = context;
+      micTestSourceRef.current = source;
+      micTestDestinationRef.current = destination;
+      micTestAudioRef.current = audio;
+    } catch (error) {
+      console.error("Unable to start microphone test:", error);
+
+      micTestActiveRef.current = false;
+
+      setMicTestActive(false);
+    }
+  };
+
+  const toggleMicTest = async () => {
+    if (micTestActive) {
+      await stopMicTest();
+    } else {
+      await startMicTest();
+    }
+  };
+
   const changeInput = async (deviceId: string) => {
+    if (micTestActiveRef.current) {
+      await stopMicTest();
+    }
+
     setSelectedInput(deviceId);
+
     localStorage.setItem("audioInput", deviceId);
 
     if (roomRef.current) {
@@ -542,11 +914,11 @@ function App() {
 
     localStorage.setItem("audioOutput", deviceId);
 
-    if (testAudioRef.current && "setSinkId" in testAudioRef.current) {
+    if (micTestAudioRef.current && "setSinkId" in micTestAudioRef.current) {
       try {
-        await testAudioRef.current.setSinkId(deviceId);
+        await micTestAudioRef.current.setSinkId(deviceId);
       } catch (error) {
-        console.error("Unable to change test output device:", error);
+        console.error("Unable to change microphone test output:", error);
       }
     }
 
@@ -565,120 +937,38 @@ function App() {
     const nextMuted = !muted;
 
     setMuted(nextMuted);
+    mutedRef.current = nextMuted;
 
-    streamRef.current?.getAudioTracks().forEach((track) => {
-      track.enabled = !nextMuted;
-    });
+    if (nextMuted) {
+      await setLiveKitMic(false);
 
-    if (roomRef.current) {
-      try {
-        await roomRef.current.localParticipant.setMicrophoneEnabled(!nextMuted);
-      } catch (error) {
-        console.error("Unable to change LiveKit microphone state:", error);
-      }
-    }
-  };
-
-  const activeTestDistance = fakePlayerOffset;
-
-  const normalizedDistance = Math.min(activeTestDistance / 5000, 1);
-
-  const proximityVolume = Math.pow(1 - normalizedDistance, 1.6);
-
-  useEffect(() => {
-    if (testGainRef.current) {
-      testGainRef.current.gain.value = proximityVolume;
-    }
-  }, [proximityVolume]);
-
-  useEffect(() => {
-    if (testPannerRef.current) {
-      testPannerRef.current.pan.value = testPan / 100;
-    }
-  }, [testPan]);
-
-  const stopTestMode = async () => {
-    testAudioRef.current?.pause();
-    testAudioRef.current = null;
-
-    testSourceRef.current?.disconnect();
-    testSourceRef.current = null;
-
-    testGainRef.current?.disconnect();
-    testGainRef.current = null;
-
-    testPannerRef.current?.disconnect();
-    testPannerRef.current = null;
-
-    testDestinationRef.current?.disconnect();
-    testDestinationRef.current = null;
-
-    if (testAudioContextRef.current) {
-      await testAudioContextRef.current.close();
-      testAudioContextRef.current = null;
+      return;
     }
 
-    setTestMode(false);
-  };
-
-  const startTestMode = async () => {
-    if (!streamRef.current) return;
-
-    try {
-      const audioContext = new AudioContext();
-
-      const source = audioContext.createMediaStreamSource(streamRef.current);
-
-      const gain = audioContext.createGain();
-      const panner = audioContext.createStereoPanner();
-
-      const destination = audioContext.createMediaStreamDestination();
-
-      gain.gain.value = proximityVolume;
-      panner.pan.value = testPan / 100;
-
-      source.connect(gain);
-      gain.connect(panner);
-      panner.connect(destination);
-
-      const audio = new Audio();
-
-      audio.srcObject = destination.stream;
-
-      if ("setSinkId" in audio && selectedOutput) {
-        await audio.setSinkId(selectedOutput);
-      }
-
-      await audio.play();
-
-      testAudioContextRef.current = audioContext;
-      testSourceRef.current = source;
-      testGainRef.current = gain;
-      testPannerRef.current = panner;
-      testDestinationRef.current = destination;
-      testAudioRef.current = audio;
-
-      setTestMode(true);
-    } catch (error) {
-      console.error("Unable to start proximity test:", error);
-    }
-  };
-
-  const toggleTestMode = async () => {
-    if (testMode) {
-      await stopTestMode();
+    if (voiceModeRef.current === "open" && !micTestActiveRef.current) {
+      await setLiveKitMic(true);
     } else {
-      await startTestMode();
+      await setLiveKitMic(false);
+    }
+  };
+
+  const openSupport = async () => {
+    try {
+      await openUrl(SUPPORT_URL);
+    } catch (error) {
+      console.error("Unable to open Discord support:", error);
     }
   };
 
   useEffect(() => {
     return () => {
-      testAudioRef.current?.pause();
+      micTestAudioRef.current?.pause();
 
-      if (testAudioContextRef.current) {
-        testAudioContextRef.current.close();
+      if (micTestContextRef.current) {
+        micTestContextRef.current.close();
       }
+
+      unregister("V").catch(() => {});
 
       cleanupRemoteAudio();
 
@@ -688,137 +978,367 @@ function App() {
 
   return (
     <main className="app">
-      <h1>Greenland Voice</h1>
+      <header className="topbar">
+        <div className="brand">
+          <div className="brand-logo">G</div>
 
-      <div className="status">
-        <span className={`dot ${backendConnected ? "online" : ""}`} />
-        Backend: {backendConnected ? "Connected" : "Disconnected"}
-      </div>
+          <div>
+            <div className="brand-title">Greenland Voice</div>
 
-      <div className="status">
-        <span className={`dot ${voiceConnected ? "online" : ""}`} />
-        Voice:{" "}
-        {voiceConnecting
-          ? "Connecting..."
-          : voiceConnected
-            ? "Connected"
-            : "Disconnected"}
-      </div>
-
-      <div className="status">
-        <span className={`dot ${gamePid ? "online" : ""}`} />
-        The Isle: {gamePid ? `Detected (${gamePid})` : "Not Running"}
-      </div>
-
-      {playerPosition && (
-        <div className="status">
-          X: {playerPosition.x.toFixed(0)} | Y: {playerPosition.y.toFixed(0)} |
-          Z: {playerPosition.z.toFixed(0)}
+            <div className="brand-subtitle">PROXIMITY VOICE</div>
+          </div>
         </div>
-      )}
 
-      {nearbyPlayers.map((player) => (
-        <div key={player.steamId} className="status">
-          {player.name}: {player.distance.toFixed(0)} units |{" "}
-          {Math.round(player.volume * 100)}%
-        </div>
-      ))}
-
-      <div className="panel">
-        <label>
-          Microphone
-          <select
-            value={selectedInput}
-            onChange={(e) => changeInput(e.target.value)}
-          >
-            {inputs.map((device) => (
-              <option key={device.deviceId} value={device.deviceId}>
-                {device.label}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <div className="meter">
+        <div className="topbar-right">
           <div
-            className="meter-fill"
-            style={{
-              width: `${micLevel}%`,
-            }}
+            className={`voice-status ${
+              voiceConnected
+                ? "online"
+                : voiceConnecting
+                  ? "waiting"
+                  : "offline"
+            }`}
+          >
+            <span />
+
+            {voiceConnecting
+              ? "Connecting"
+              : voiceConnected
+                ? "Connected"
+                : "Disconnected"}
+          </div>
+
+          {steamId && !steamVerified && (
+            <button
+              className="verify-steam"
+              onClick={verifySteam}
+              disabled={steamVerifying}
+            >
+              {steamVerifying ? "Waiting for Steam..." : "Verify with Steam"}
+            </button>
+          )}
+
+          <button
+            className="restart-button"
+            onClick={reconnectVoice}
+            disabled={
+              reconnecting || voiceConnecting || !steamVerified || !sessionToken
+            }
+          >
+            ↻ {reconnecting ? "Reconnecting" : "Reconnect"}
+          </button>
+
+          {voiceConnected && (
+            <button className="stop-button" onClick={connectVoice}>
+              Disconnect
+            </button>
+          )}
+        </div>
+      </header>
+
+      <div className="hidden-status-row">
+        <div className="mini-status tooltip-parent">
+          <span
+            className={`mini-dot ${
+              steamVerified ? "online" : steamId ? "waiting" : "offline"
+            }`}
+          />
+
+          {steamVerified
+            ? "Steam Verified"
+            : steamId
+              ? "Steam Detected"
+              : "Steam"}
+
+          <Tooltip
+            title={
+              steamVerified
+                ? "Steam verified"
+                : steamId
+                  ? "Verification required"
+                  : "Steam not detected"
+            }
+            body={
+              steamVerified
+                ? "Your Steam identity has been securely verified."
+                : steamId
+                  ? "Verify with Steam before connecting to voice."
+                  : "Open Steam and make sure you are signed in."
+            }
           />
         </div>
 
-        <button onClick={toggleMute}>
-          {muted ? "Unmute Mic" : "Mute Mic"}
-        </button>
+        <div className="mini-status tooltip-parent">
+          <span className={`mini-dot ${gamePid ? "online" : "offline"}`} />
+          The Isle
+          <Tooltip
+            title={gamePid ? "The Isle is running" : "The Isle is not running"}
+            body={
+              gamePid
+                ? "Game detection is active."
+                : "Launch The Isle to enable player tracking."
+            }
+          />
+        </div>
 
-        <label>
-          Output
-          <select
-            value={selectedOutput}
-            onChange={(e) => changeOutput(e.target.value)}
-          >
-            {outputs.map((device) => (
-              <option key={device.deviceId} value={device.deviceId}>
-                {device.label}
-              </option>
-            ))}
-          </select>
-        </label>
+        <div className="mini-status tooltip-parent">
+          <span
+            className={`mini-dot ${playerPosition ? "online" : "waiting"}`}
+          />
+          Tracking
+          <Tooltip
+            title={
+              playerPosition ? "Position detected" : "Waiting for position"
+            }
+            body={
+              playerPosition
+                ? "Your coordinates are updating."
+                : "Join Greenland PH to begin proximity tracking."
+            }
+          />
+        </div>
       </div>
 
-      <div className="test-panel">
-        <h2>Developer Test Tools</h2>
-
-        <button onClick={toggleTestMode}>
-          {testMode ? "Stop Test Mode" : "Start Test Mode"}
-        </button>
-
-        {testMode && (
-          <>
-            <label>
-              Fake Player Distance: {fakePlayerOffset} units
-              <input
-                type="range"
-                min="0"
-                max="5000"
-                step="100"
-                value={fakePlayerOffset}
-                onChange={(e) => setFakePlayerOffset(Number(e.target.value))}
-              />
-            </label>
-
-            <div>Simulated Volume: {Math.round(proximityVolume * 100)}%</div>
-
-            <label>
-              Position: {testPan}
-              <input
-                type="range"
-                min="-100"
-                max="100"
-                value={testPan}
-                onChange={(e) => setTestPan(Number(e.target.value))}
-              />
-            </label>
-
+      <div className="main-grid">
+        <section className="voice-panel">
+          <div className="panel-heading">
             <div>
-              {testPan < -10 ? "Left" : testPan > 10 ? "Right" : "Center"}
+              <span className="section-label">Voice Settings</span>
+
+              <h2>Microphone & Audio</h2>
             </div>
-          </>
-        )}
+
+            <div
+              className={`transmit-status ${
+                muted ? "muted" : isTransmitting ? "active" : ""
+              }`}
+            >
+              <span />
+
+              {muted ? "Muted" : isTransmitting ? "Transmitting" : "Idle"}
+            </div>
+          </div>
+
+          <div className="voice-mode-row">
+            <button
+              className={`mode-button ${voiceMode === "open" ? "active" : ""}`}
+              onClick={() => changeVoiceMode("open")}
+            >
+              <strong>Open Mic</strong>
+              <span>Always transmit</span>
+            </button>
+
+            <button
+              className={`mode-button ${voiceMode === "ptt" ? "active" : ""}`}
+              onClick={() => changeVoiceMode("ptt")}
+            >
+              <strong>Push to Talk</strong>
+              <span>Hold V to speak</span>
+            </button>
+          </div>
+
+          {voiceMode === "ptt" && (
+            <div className="ptt-setting">
+              <div>
+                <strong>Push to Talk Key</strong>
+
+                <span>Works while The Isle is focused</span>
+              </div>
+
+              <kbd>V</kbd>
+            </div>
+          )}
+
+          <div className="device-grid">
+            <label>
+              <span className="field-label">Microphone</span>
+
+              <select
+                value={selectedInput}
+                onChange={(event) => changeInput(event.target.value)}
+              >
+                {inputs.map((device) => (
+                  <option key={device.deviceId} value={device.deviceId}>
+                    {device.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              <span className="field-label">Output Device</span>
+
+              <select
+                value={selectedOutput}
+                onChange={(event) => changeOutput(event.target.value)}
+              >
+                {outputs.map((device) => (
+                  <option key={device.deviceId} value={device.deviceId}>
+                    {device.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div className="mic-controls">
+            <div className="level-section">
+              <div className="level-header">
+                <span>Mic Level</span>
+
+                <span>{Math.round(micLevel)}%</span>
+              </div>
+
+              <div className="meter">
+                <div
+                  className="meter-fill"
+                  style={{
+                    width: `${micLevel}%`,
+                  }}
+                />
+              </div>
+            </div>
+
+            <button
+              className={`utility-button ${micTestActive ? "active" : ""}`}
+              onClick={toggleMicTest}
+            >
+              {micTestActive ? "Stop Test" : "Mic Test"}
+            </button>
+
+            <button
+              className={`mute-button ${muted ? "active" : ""}`}
+              onClick={toggleMute}
+            >
+              {muted ? "Unmute Mic" : "Mute Mic"}
+            </button>
+          </div>
+
+          {micTestActive && (
+            <div className="info-message">
+              You are hearing your microphone locally. Voice transmission is
+              paused during the test.
+            </div>
+          )}
+        </section>
+
+        <aside className="side-panel">
+          <section className="position-card">
+            <div className="card-title-row">
+              <div>
+                <span className="section-label">Player Position</span>
+
+                <h3>Current Coordinates</h3>
+              </div>
+
+              <span className={`live-badge ${playerPosition ? "online" : ""}`}>
+                <span />
+
+                {playerPosition ? "Live" : "Waiting"}
+              </span>
+            </div>
+
+            {playerPosition ? (
+              <div className="coordinates">
+                <div>
+                  <span>X</span>
+                  <strong>{playerPosition.x.toFixed(0)}</strong>
+                </div>
+
+                <div>
+                  <span>Y</span>
+                  <strong>{playerPosition.y.toFixed(0)}</strong>
+                </div>
+
+                <div>
+                  <span>Z</span>
+                  <strong>{playerPosition.z.toFixed(0)}</strong>
+                </div>
+              </div>
+            ) : (
+              <div className="empty-box">Waiting for player position</div>
+            )}
+          </section>
+
+          <section className="support-card">
+            <span className="section-label">Support</span>
+
+            <h3>Having problems?</h3>
+
+            <p>
+              Reconnect voice first. If the problem continues, open the
+              Greenland PH support channel.
+            </p>
+
+            <div className="support-actions">
+              <button
+                className="utility-button"
+                onClick={reconnectVoice}
+                disabled={
+                  reconnecting ||
+                  voiceConnecting ||
+                  !steamVerified ||
+                  !sessionToken
+                }
+              >
+                Reconnect
+              </button>
+
+              <button className="discord-button" onClick={openSupport}>
+                Discord Support
+              </button>
+            </div>
+          </section>
+        </aside>
       </div>
 
-      <button
-        className="connect"
-        onClick={connectVoice}
-        disabled={voiceConnecting || !steamId}
-      >
-        {voiceConnecting
-          ? "Connecting..."
-          : voiceConnected
-            ? "Disconnect Voice"
-            : "Connect Voice"}
-      </button>
+      <section className="players-panel">
+        <div className="players-header">
+          <div>
+            <span className="section-label">Proximity</span>
+
+            <h2>Nearby Players</h2>
+          </div>
+
+          <div className="players-count">{nearbyPlayers.length}</div>
+        </div>
+
+        <div className="players-list">
+          {nearbyPlayers.length > 0 ? (
+            nearbyPlayers.map((player) => (
+              <div className="player-item" key={player.steamId}>
+                <span className="player-status" />
+
+                <span>{player.name}</span>
+              </div>
+            ))
+          ) : (
+            <div className="players-empty">
+              No players currently in voice range
+            </div>
+          )}
+        </div>
+      </section>
+
+      {!voiceConnected && (
+        <button
+          className="connect-button"
+          onClick={connectVoice}
+          disabled={
+            voiceConnecting ||
+            reconnecting ||
+            !steamId ||
+            !steamVerified ||
+            !sessionToken
+          }
+        >
+          {!steamVerified
+            ? "Verify Steam to Connect"
+            : voiceConnecting
+              ? "Connecting..."
+              : "Connect Voice"}
+        </button>
+      )}
     </main>
   );
 }
