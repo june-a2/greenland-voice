@@ -63,6 +63,7 @@ type DeviceDropdownProps = {
   label: string;
   devices: Device[];
   value: string;
+  emptyLabel: string;
 
   onChange: (deviceId: string) => void | Promise<void>;
 };
@@ -110,6 +111,7 @@ function DeviceDropdown({
   label,
   devices,
   value,
+  emptyLabel,
   onChange,
 }: DeviceDropdownProps) {
   const [open, setOpen] = useState(false);
@@ -158,9 +160,11 @@ function DeviceDropdown({
           className="device-dropdown-trigger"
           onClick={() => setOpen((current) => !current)}
           aria-expanded={open}
+          disabled={devices.length === 0}
         >
           <span className="device-dropdown-value">
-            {selectedDevice?.label || "Select device"}
+            {selectedDevice?.label ||
+              (devices.length === 0 ? emptyLabel : "Select device")}
           </span>
 
           <ChevronDown
@@ -485,11 +489,29 @@ function App() {
   }, [listeningForPttKey]);
 
   useEffect(() => {
-    const loadDevices = async () => {
+    let initialized = false;
+    let previousInputs: Device[] = [];
+    let previousOutputs: Device[] = [];
+    let refreshRunning = false;
+
+    const getDeviceLabel = (device: Device, fallback: string) =>
+      device.label || fallback;
+
+    const refreshDevices = async (announceChanges: boolean) => {
+      if (refreshRunning) {
+        return;
+      }
+
+      refreshRunning = true;
+
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-        });
+        if (!initialized) {
+          const permissionStream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+          });
+
+          permissionStream.getTracks().forEach((track) => track.stop());
+        }
 
         const devices = await navigator.mediaDevices.enumerateDevices();
 
@@ -497,7 +519,6 @@ function App() {
           .filter((device) => device.kind === "audioinput")
           .map((device) => ({
             deviceId: device.deviceId,
-
             label: device.label || "Microphone",
           }));
 
@@ -505,23 +526,141 @@ function App() {
           .filter((device) => device.kind === "audiooutput")
           .map((device) => ({
             deviceId: device.deviceId,
-
             label: device.label || "Output Device",
           }));
 
-        setInputs(inputDevices);
+        if (initialized && announceChanges) {
+          const previousInputIds = new Set(
+            previousInputs.map((device) => device.deviceId),
+          );
+          const previousOutputIds = new Set(
+            previousOutputs.map((device) => device.deviceId),
+          );
+          const nextInputIds = new Set(
+            inputDevices.map((device) => device.deviceId),
+          );
+          const nextOutputIds = new Set(
+            outputDevices.map((device) => device.deviceId),
+          );
 
+          const connectedInputs = inputDevices.filter(
+            (device) => !previousInputIds.has(device.deviceId),
+          );
+          const disconnectedInputs = previousInputs.filter(
+            (device) => !nextInputIds.has(device.deviceId),
+          );
+          const connectedOutputs = outputDevices.filter(
+            (device) => !previousOutputIds.has(device.deviceId),
+          );
+          const disconnectedOutputs = previousOutputs.filter(
+            (device) => !nextOutputIds.has(device.deviceId),
+          );
+
+          const changes: string[] = [];
+
+          for (const device of connectedInputs) {
+            changes.push(
+              `Microphone connected: ${getDeviceLabel(device, "Microphone")}`,
+            );
+          }
+
+          for (const device of disconnectedInputs) {
+            changes.push(
+              `Microphone disconnected: ${getDeviceLabel(device, "Microphone")}`,
+            );
+          }
+
+          for (const device of connectedOutputs) {
+            changes.push(
+              `Output connected: ${getDeviceLabel(device, "Output Device")}`,
+            );
+          }
+
+          for (const device of disconnectedOutputs) {
+            changes.push(
+              `Output disconnected: ${getDeviceLabel(device, "Output Device")}`,
+            );
+          }
+
+          if (changes.length > 0) {
+            const onlyConnected =
+              disconnectedInputs.length === 0 &&
+              disconnectedOutputs.length === 0;
+            const onlyDisconnected =
+              connectedInputs.length === 0 && connectedOutputs.length === 0;
+
+            showToast(
+              onlyDisconnected ? "error" : onlyConnected ? "success" : "info",
+              onlyDisconnected
+                ? "Audio device disconnected"
+                : onlyConnected
+                  ? "Audio device connected"
+                  : "Audio devices changed",
+              changes.join(" • "),
+              5200,
+            );
+          }
+        }
+
+        setInputs(inputDevices);
         setOutputs(outputDevices);
 
-        if (!selectedInput && inputDevices.length > 0) {
-          setSelectedInput(inputDevices[0].deviceId);
+        const selectedInputStillExists = inputDevices.some(
+          (device) => device.deviceId === selectedInput,
+        );
+        const selectedOutputStillExists = outputDevices.some(
+          (device) => device.deviceId === selectedOutputRef.current,
+        );
+
+        if (!selectedInputStillExists) {
+          const fallbackInput = inputDevices[0]?.deviceId || "";
+          setSelectedInput(fallbackInput);
+
+          if (fallbackInput) {
+            localStorage.setItem("audioInput", fallbackInput);
+
+            if (roomRef.current) {
+              try {
+                await roomRef.current.switchActiveDevice(
+                  "audioinput",
+                  fallbackInput,
+                );
+              } catch (error) {
+                console.error("Unable to switch fallback microphone:", error);
+              }
+            }
+          } else {
+            localStorage.removeItem("audioInput");
+            setMicLevel(0);
+            await setLiveKitMic(false);
+          }
         }
 
-        if (!selectedOutput && outputDevices.length > 0) {
-          setSelectedOutput(outputDevices[0].deviceId);
+        if (!selectedOutputStillExists) {
+          const fallbackOutput = outputDevices[0]?.deviceId || "";
+          setSelectedOutput(fallbackOutput);
+          selectedOutputRef.current = fallbackOutput;
+
+          if (fallbackOutput) {
+            localStorage.setItem("audioOutput", fallbackOutput);
+
+            for (const audio of remoteAudioRef.current.values()) {
+              if ("setSinkId" in audio) {
+                try {
+                  await audio.setSinkId(fallbackOutput);
+                } catch (error) {
+                  console.error("Unable to switch fallback output:", error);
+                }
+              }
+            }
+          } else {
+            localStorage.removeItem("audioOutput");
+          }
         }
 
-        stream.getTracks().forEach((track) => track.stop());
+        previousInputs = inputDevices;
+        previousOutputs = outputDevices;
+        initialized = true;
       } catch (error) {
         console.error("Unable to load audio devices:", error);
 
@@ -535,10 +674,25 @@ function App() {
             ? "Microphone permission was denied. Allow microphone access and restart Greenland Voice."
             : "Greenland Voice couldn't load your audio devices.",
         );
+      } finally {
+        refreshRunning = false;
       }
     };
 
-    loadDevices();
+    const handleDeviceChange = () => {
+      void refreshDevices(true);
+    };
+
+    void refreshDevices(false);
+
+    navigator.mediaDevices.addEventListener("devicechange", handleDeviceChange);
+
+    return () => {
+      navigator.mediaDevices.removeEventListener(
+        "devicechange",
+        handleDeviceChange,
+      );
+    };
   }, []);
 
   useEffect(() => {
@@ -1789,6 +1943,7 @@ function App() {
               label="Microphone"
               devices={inputs}
               value={selectedInput}
+              emptyLabel="No microphone connected"
               onChange={changeInput}
             />
 
@@ -1796,6 +1951,7 @@ function App() {
               label="Output Device"
               devices={outputs}
               value={selectedOutput}
+              emptyLabel="No output device connected"
               onChange={changeOutput}
             />
           </div>

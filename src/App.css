@@ -793,6 +793,22 @@ h3 {
   background: #1c1e1c;
 }
 
+.device-dropdown-trigger:disabled {
+  border-color: #292c29;
+
+  background: #121312;
+  color: #6f736f;
+
+  box-shadow: none;
+
+  cursor: default;
+}
+
+.device-dropdown-trigger:disabled .device-dropdown-value,
+.device-dropdown-trigger:disabled .device-dropdown-chevron {
+  color: #6f736f;
+}
+
 .device-dropdown.open .device-dropdown-trigger {
   border-color: #92c553;
 
