@@ -79,6 +79,19 @@ let rconReconnectTimer: NodeJS.Timeout | null = null;
 
 let rconBuffer = Buffer.alloc(0);
 let rconAuthenticated = false;
+let rconRequestPending = false;
+let rconResponseSettleTimer: NodeJS.Timeout | null = null;
+let rconResponseTimeout: NodeJS.Timeout | null = null;
+let rconAuthTimeout: NodeJS.Timeout | null = null;
+let consecutiveRconMisses = 0;
+let lastPlayerUpdateAt = 0;
+
+const RCON_POLL_MS = 1000;
+const RCON_RESPONSE_SETTLE_MS = 120;
+const RCON_RESPONSE_TIMEOUT_MS = 2500;
+const RCON_AUTH_TIMEOUT_MS = 10_000;
+const RCON_MISSES_BEFORE_CLEAR = 3;
+const RCON_MAX_BUFFER_BYTES = 512 * 1024;
 
 function createRandomToken() {
   return crypto.randomBytes(32).toString("base64url");
@@ -342,6 +355,9 @@ const httpServer = http.createServer(async (req, res) => {
       players: currentPlayers.length,
 
       rcon: rconAuthenticated ? "connected" : "disconnected",
+
+      playerDataAgeMs:
+        lastPlayerUpdateAt > 0 ? Date.now() - lastPlayerUpdateAt : null,
     });
 
     return;
@@ -851,12 +867,69 @@ wss.on("connection", (socket) => {
   });
 });
 
+function clearRconTimer(timer: NodeJS.Timeout | null) {
+  if (timer) {
+    clearTimeout(timer);
+  }
+}
+
 function stopRconPoll() {
   if (rconPollInterval) {
     clearInterval(rconPollInterval);
 
     rconPollInterval = null;
   }
+
+  clearRconTimer(rconResponseSettleTimer);
+  clearRconTimer(rconResponseTimeout);
+  clearRconTimer(rconAuthTimeout);
+
+  rconResponseSettleTimer = null;
+  rconResponseTimeout = null;
+  rconAuthTimeout = null;
+
+  rconRequestPending = false;
+}
+
+function clearPlayers(reason: string) {
+  const hadPlayers = currentPlayers.length > 0;
+
+  currentPlayers = [];
+  lastPlayerUpdateAt = Date.now();
+
+  if (hadPlayers) {
+    console.warn(`Cleared tracked players: ${reason}`);
+  }
+
+  broadcastSnapshots();
+}
+
+function recordRconMiss(reason: string) {
+  consecutiveRconMisses += 1;
+
+  console.warn(
+    `RCON player poll miss ${consecutiveRconMisses}/${RCON_MISSES_BEFORE_CLEAR}: ${reason}`,
+  );
+
+  if (consecutiveRconMisses >= RCON_MISSES_BEFORE_CLEAR) {
+    clearPlayers(`RCON player data unavailable (${reason})`);
+  }
+}
+
+function acceptPlayerSnapshot(players: Player[]) {
+  const previousCount = currentPlayers.length;
+
+  currentPlayers = players;
+  lastPlayerUpdateAt = Date.now();
+  consecutiveRconMisses = 0;
+
+  if (previousCount !== players.length) {
+    console.log(
+      `RCON player count changed: ${previousCount} -> ${players.length}`,
+    );
+  }
+
+  broadcastSnapshots();
 }
 
 function scheduleRconReconnect() {
@@ -871,65 +944,141 @@ function scheduleRconReconnect() {
   }, 5000);
 }
 
-function sendPlayerDataRequest() {
-  if (!rconSocket || !rconAuthenticated || rconSocket.destroyed) {
+function finishPlayerRequest() {
+  rconRequestPending = false;
+
+  clearRconTimer(rconResponseSettleTimer);
+  clearRconTimer(rconResponseTimeout);
+
+  rconResponseSettleTimer = null;
+  rconResponseTimeout = null;
+}
+
+function processPlayerResponse() {
+  if (!rconRequestPending) {
     return;
   }
 
-  const commandPacket = Buffer.from([0x02, 0x77, 0x00]);
+  const text = rconBuffer.toString("utf8").trim();
 
-  rconSocket.write(commandPacket);
-}
+  rconBuffer = Buffer.alloc(0);
 
-function handleRconResponse(text: string) {
-  if (text.includes("Password Accepted")) {
-    if (!rconAuthenticated) {
-      console.log("RCON authenticated");
-    }
+  finishPlayerRequest();
 
-    rconAuthenticated = true;
+  if (!text) {
+    recordRconMiss("empty response");
 
-    if (!rconPollInterval) {
-      sendPlayerDataRequest();
-
-      rconPollInterval = setInterval(sendPlayerDataRequest, 1000);
-    }
+    return;
   }
 
   const players = parsePlayers(text);
 
   if (players.length > 0) {
-    currentPlayers = players;
+    acceptPlayerSnapshot(players);
 
-    broadcastSnapshots();
+    return;
   }
 
-  const looksLikeEmptyPlayerResponse =
-    text.includes("PlayerID:") === false &&
-    text.includes("Password Accepted") === false &&
-    text.trim().length > 0;
+  const lower = text.toLowerCase();
 
-  if (looksLikeEmptyPlayerResponse && players.length === 0) {
-    const lower = text.toLowerCase();
+  const explicitEmptyResponse =
+    lower.includes("no players") ||
+    lower.includes("0 players") ||
+    lower.includes("player count: 0");
 
-    if (
-      lower.includes("no players") ||
-      lower.includes("0 players") ||
-      lower.includes("player count: 0")
-    ) {
-      currentPlayers = [];
+  if (explicitEmptyResponse) {
+    acceptPlayerSnapshot([]);
 
-      broadcastSnapshots();
+    return;
+  }
+
+  /*
+   * The Isle can return a non-player payload when no usable player rows
+   * are present. Do not immediately trust one unrecognized response as
+   * "zero players"; require several consecutive misses before clearing
+   * the previous snapshot. This prevents one fragmented or malformed
+   * packet from instantly dropping everyone's tracking.
+   */
+  recordRconMiss("response contained no parseable player rows");
+}
+
+function schedulePlayerResponseSettle() {
+  clearRconTimer(rconResponseSettleTimer);
+
+  rconResponseSettleTimer = setTimeout(() => {
+    processPlayerResponse();
+  }, RCON_RESPONSE_SETTLE_MS);
+}
+
+function sendPlayerDataRequest() {
+  if (
+    !rconSocket ||
+    !rconAuthenticated ||
+    rconSocket.destroyed ||
+    rconRequestPending
+  ) {
+    return;
+  }
+
+  rconRequestPending = true;
+  rconBuffer = Buffer.alloc(0);
+
+  const commandPacket = Buffer.from([0x02, 0x77, 0x00]);
+
+  rconSocket.write(commandPacket);
+
+  clearRconTimer(rconResponseTimeout);
+
+  rconResponseTimeout = setTimeout(() => {
+    if (!rconRequestPending) {
+      return;
     }
+
+    rconBuffer = Buffer.alloc(0);
+
+    finishPlayerRequest();
+
+    recordRconMiss("response timeout");
+  }, RCON_RESPONSE_TIMEOUT_MS);
+}
+
+function handleRconAuthResponse(text: string) {
+  if (!text.includes("Password Accepted")) {
+    return false;
   }
+
+  if (!rconAuthenticated) {
+    console.log("RCON authenticated");
+  }
+
+  clearRconTimer(rconAuthTimeout);
+  rconAuthTimeout = null;
+
+  rconAuthenticated = true;
+  consecutiveRconMisses = 0;
+  rconBuffer = Buffer.alloc(0);
+
+  if (!rconPollInterval) {
+    sendPlayerDataRequest();
+
+    rconPollInterval = setInterval(sendPlayerDataRequest, RCON_POLL_MS);
+  }
+
+  return true;
 }
 
 function connectRcon() {
   stopRconPoll();
 
   rconAuthenticated = false;
-
+  rconRequestPending = false;
+  consecutiveRconMisses = 0;
   rconBuffer = Buffer.alloc(0);
+
+  if (rconReconnectTimer) {
+    clearTimeout(rconReconnectTimer);
+    rconReconnectTimer = null;
+  }
 
   if (rconSocket && !rconSocket.destroyed) {
     rconSocket.destroy();
@@ -942,6 +1091,9 @@ function connectRcon() {
 
     port: RCON_PORT,
   });
+
+  socket.setNoDelay(true);
+  socket.setKeepAlive(true, 10_000);
 
   rconSocket = socket;
 
@@ -957,35 +1109,52 @@ function connectRcon() {
     ]);
 
     socket.write(authPacket);
+
+    clearRconTimer(rconAuthTimeout);
+
+    rconAuthTimeout = setTimeout(() => {
+      if (rconAuthenticated || socket.destroyed) {
+        return;
+      }
+
+      console.error("RCON authentication timed out");
+
+      socket.destroy();
+    }, RCON_AUTH_TIMEOUT_MS);
   });
 
   socket.on("data", (data) => {
     rconBuffer = Buffer.concat([rconBuffer, data]);
 
+    if (rconBuffer.length > RCON_MAX_BUFFER_BYTES) {
+      console.warn("RCON buffer exceeded safe size");
+
+      rconBuffer = Buffer.alloc(0);
+
+      if (rconRequestPending) {
+        finishPlayerRequest();
+
+        recordRconMiss("buffer exceeded safe size");
+      }
+
+      return;
+    }
+
     const text = rconBuffer.toString("utf8");
 
-    if (text.includes("Password Accepted")) {
-      handleRconResponse(text);
-
-      rconBuffer = Buffer.alloc(0);
+    if (!rconAuthenticated) {
+      handleRconAuthResponse(text);
 
       return;
     }
 
-    const parsed = parsePlayers(text);
-
-    if (parsed.length > 0) {
-      handleRconResponse(text);
-
-      rconBuffer = Buffer.alloc(0);
-
-      return;
-    }
-
-    if (rconBuffer.length > 512 * 1024) {
-      console.warn("RCON buffer exceeded safe size; clearing buffer");
-
-      rconBuffer = Buffer.alloc(0);
+    if (rconRequestPending) {
+      /*
+       * TCP does not preserve message boundaries. A getplayerdata response
+       * can arrive in more than one chunk, so wait briefly after the most
+       * recent chunk before parsing the accumulated response.
+       */
+      schedulePlayerResponseSettle();
     }
   });
 
@@ -996,13 +1165,17 @@ function connectRcon() {
   socket.on("close", () => {
     console.warn("RCON disconnected");
 
+    const wasCurrentSocket = rconSocket === socket;
+
     rconAuthenticated = false;
 
     stopRconPoll();
 
-    if (rconSocket === socket) {
+    if (wasCurrentSocket) {
       rconSocket = null;
     }
+
+    clearPlayers("RCON disconnected");
 
     scheduleRconReconnect();
   });
