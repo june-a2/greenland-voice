@@ -1,11 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Room, RoomEvent } from "livekit-client";
+import { Room, RoomEvent, Track } from "livekit-client";
 import "./App.css";
 
 type Device = {
   deviceId: string;
   label: string;
+};
+
+type NearbyPlayer = {
+  name: string;
+  steamId: string;
+  distance: number;
+  volume: number;
 };
 
 function App() {
@@ -33,14 +40,7 @@ function App() {
     z: number;
   } | null>(null);
 
-  const [nearbyPlayers, setNearbyPlayers] = useState<
-    {
-      name: string;
-      steamId: string;
-      distance: number;
-      volume: number;
-    }[]
-  >([]);
+  const [nearbyPlayers, setNearbyPlayers] = useState<NearbyPlayer[]>([]);
 
   const [steamId, setSteamId] = useState<string | null>(null);
 
@@ -53,6 +53,10 @@ function App() {
 
   const roomRef = useRef<Room | null>(null);
 
+  const remoteAudioRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const nearbyPlayersRef = useRef<NearbyPlayer[]>([]);
+  const selectedOutputRef = useRef(selectedOutput);
+
   const testAudioContextRef = useRef<AudioContext | null>(null);
   const testSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const testGainRef = useRef<GainNode | null>(null);
@@ -62,6 +66,26 @@ function App() {
   );
 
   const testAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  const applyRemoteVolumes = () => {
+    const nearby = nearbyPlayersRef.current;
+
+    for (const [remoteSteamId, audio] of remoteAudioRef.current.entries()) {
+      const player = nearby.find((player) => player.steamId === remoteSteamId);
+
+      audio.volume = player ? Math.max(0, Math.min(1, player.volume)) : 0;
+    }
+  };
+
+  const cleanupRemoteAudio = () => {
+    for (const audio of remoteAudioRef.current.values()) {
+      audio.pause();
+      audio.srcObject = null;
+      audio.remove();
+    }
+
+    remoteAudioRef.current.clear();
+  };
 
   useEffect(() => {
     const loadDevices = async () => {
@@ -218,7 +242,6 @@ function App() {
         if (!stopped) {
           reconnectTimer = window.setTimeout(() => {
             console.log("Reconnecting to Greenland backend...");
-
             connectBackend();
           }, 3000);
         }
@@ -243,7 +266,7 @@ function App() {
               z,
             });
 
-            const others = data.players
+            const others: NearbyPlayer[] = data.players
               .filter((other: { steamId: string }) => other.steamId !== steamId)
               .map(
                 (other: {
@@ -276,9 +299,9 @@ function App() {
                   };
                 },
               )
-              .filter((player: { volume: number }) => player.volume > 0);
+              .filter((player: NearbyPlayer) => player.volume > 0);
 
-            setNearbyPlayers(others);
+            nearbyPlayersRef.current = others;
 
             if (testMode) {
               const fakeDistance = Math.abs(fakePlayerOffset);
@@ -296,7 +319,11 @@ function App() {
                   volume,
                 },
               ]);
+            } else {
+              setNearbyPlayers(others);
             }
+
+            applyRemoteVolumes();
           }
         }
       };
@@ -315,6 +342,18 @@ function App() {
     };
   }, [steamId]);
 
+  useEffect(() => {
+    nearbyPlayersRef.current = nearbyPlayers.filter(
+      (player) => player.steamId !== "test-player",
+    );
+
+    applyRemoteVolumes();
+  }, [nearbyPlayers]);
+
+  useEffect(() => {
+    selectedOutputRef.current = selectedOutput;
+  }, [selectedOutput]);
+
   const connectVoice = async () => {
     if (!steamId) {
       console.error("Cannot connect voice: SteamID missing");
@@ -326,6 +365,9 @@ function App() {
     if (roomRef.current) {
       roomRef.current.disconnect();
       roomRef.current = null;
+
+      cleanupRemoteAudio();
+
       setVoiceConnected(false);
       return;
     }
@@ -359,6 +401,9 @@ function App() {
 
       room.on(RoomEvent.Disconnected, () => {
         console.log("Disconnected from Greenland voice");
+
+        cleanupRemoteAudio();
+
         setVoiceConnected(false);
         roomRef.current = null;
       });
@@ -366,6 +411,88 @@ function App() {
       room.on(RoomEvent.MediaDevicesError, (error) => {
         console.error("LiveKit media device error:", error);
       });
+
+      room.on(
+        RoomEvent.TrackSubscribed,
+        async (track, _publication, participant) => {
+          if (track.kind !== Track.Kind.Audio) {
+            return;
+          }
+
+          const remoteSteamId = participant.identity;
+
+          console.log(
+            `Remote voice subscribed: ${participant.name || remoteSteamId}`,
+          );
+
+          const existingAudio = remoteAudioRef.current.get(remoteSteamId);
+
+          if (existingAudio) {
+            existingAudio.pause();
+            existingAudio.srcObject = null;
+            existingAudio.remove();
+          }
+
+          const element = track.attach();
+
+          if (!(element instanceof HTMLAudioElement)) {
+            return;
+          }
+
+          element.autoplay = true;
+          element.volume = 0;
+          element.style.display = "none";
+
+          const outputDevice = selectedOutputRef.current;
+
+          if (outputDevice && "setSinkId" in element) {
+            try {
+              await element.setSinkId(outputDevice);
+            } catch (error) {
+              console.error("Unable to route remote voice output:", error);
+            }
+          }
+
+          document.body.appendChild(element);
+
+          remoteAudioRef.current.set(remoteSteamId, element);
+
+          applyRemoteVolumes();
+
+          try {
+            await element.play();
+          } catch (error) {
+            console.warn("Remote voice playback could not start:", error);
+          }
+        },
+      );
+
+      room.on(
+        RoomEvent.TrackUnsubscribed,
+        (track, _publication, participant) => {
+          if (track.kind !== Track.Kind.Audio) {
+            return;
+          }
+
+          const remoteSteamId = participant.identity;
+
+          console.log(
+            `Remote voice unsubscribed: ${participant.name || remoteSteamId}`,
+          );
+
+          const element = remoteAudioRef.current.get(remoteSteamId);
+
+          if (element) {
+            element.pause();
+            element.srcObject = null;
+            element.remove();
+
+            remoteAudioRef.current.delete(remoteSteamId);
+          }
+
+          track.detach();
+        },
+      );
 
       roomRef.current = room;
 
@@ -387,6 +514,9 @@ function App() {
 
       roomRef.current?.disconnect();
       roomRef.current = null;
+
+      cleanupRemoteAudio();
+
       setVoiceConnected(false);
     } finally {
       setVoiceConnecting(false);
@@ -406,14 +536,28 @@ function App() {
     }
   };
 
-  const changeOutput = (deviceId: string) => {
+  const changeOutput = async (deviceId: string) => {
     setSelectedOutput(deviceId);
+    selectedOutputRef.current = deviceId;
+
     localStorage.setItem("audioOutput", deviceId);
 
     if (testAudioRef.current && "setSinkId" in testAudioRef.current) {
-      testAudioRef.current.setSinkId(deviceId).catch((error) => {
-        console.error("Unable to change output device:", error);
-      });
+      try {
+        await testAudioRef.current.setSinkId(deviceId);
+      } catch (error) {
+        console.error("Unable to change test output device:", error);
+      }
+    }
+
+    for (const audio of remoteAudioRef.current.values()) {
+      if ("setSinkId" in audio) {
+        try {
+          await audio.setSinkId(deviceId);
+        } catch (error) {
+          console.error("Unable to change remote voice output device:", error);
+        }
+      }
     }
   };
 
@@ -536,13 +680,15 @@ function App() {
         testAudioContextRef.current.close();
       }
 
+      cleanupRemoteAudio();
+
       roomRef.current?.disconnect();
     };
   }, []);
 
   return (
     <main className="app">
-      <h1>GREENLAND VOICE</h1>
+      <h1>Greenland Voice</h1>
 
       <div className="status">
         <span className={`dot ${backendConnected ? "online" : ""}`} />
