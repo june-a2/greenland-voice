@@ -1,7 +1,24 @@
 import { useEffect, useRef, useState } from "react";
+
 import { invoke } from "@tauri-apps/api/core";
+
+import { listen } from "@tauri-apps/api/event";
+
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
+
 import { openUrl } from "@tauri-apps/plugin-opener";
+
+import {
+  AlertCircle,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  Info,
+  LogOut,
+  RotateCw,
+  X,
+} from "lucide-react";
+
 import { Room, RoomEvent, Track } from "livekit-client";
 
 import "@fontsource/poppins/400.css";
@@ -24,22 +41,48 @@ type NearbyPlayer = {
 
 type VoiceMode = "open" | "ptt";
 
+type PttBinding = {
+  type: "keyboard" | "mouse";
+
+  value: string;
+};
+
 type TooltipProps = {
   title: string;
   body: string;
 };
 
+type ToastType = "error" | "success" | "info";
+
+type ToastState = {
+  id: number;
+  type: ToastType;
+  title: string;
+  message: string;
+};
+
+type DeviceDropdownProps = {
+  label: string;
+  devices: Device[];
+  value: string;
+
+  onChange: (deviceId: string) => void | Promise<void>;
+};
+
 type SnapshotMessage = {
   type: "snapshot";
+
   self: {
     x: number;
     y: number;
     z: number;
   } | null;
+
   nearby: NearbyPlayer[];
 };
 
 const API_URL = "https://greenland-voice.onrender.com";
+
 const WS_URL = "wss://greenland-voice.onrender.com/ws";
 
 const SUPPORT_URL =
@@ -49,13 +92,191 @@ function Tooltip({ title, body }: TooltipProps) {
   return (
     <div className="tooltip">
       <strong>{title}</strong>
+
       <span>{body}</span>
     </div>
   );
 }
 
+function HeaderTooltip({ title, body }: TooltipProps) {
+  return (
+    <div className="header-tooltip">
+      <strong>{title}</strong>
+
+      <span>{body}</span>
+    </div>
+  );
+}
+
+function DeviceDropdown({
+  label,
+  devices,
+  value,
+  onChange,
+}: DeviceDropdownProps) {
+  const [open, setOpen] = useState(false);
+
+  const dropdownRef = useRef<HTMLDivElement | null>(null);
+
+  const selectedDevice = devices.find((device) => device.deviceId === value);
+
+  useEffect(() => {
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!dropdownRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+      }
+    };
+
+    window.addEventListener("mousedown", handlePointerDown);
+
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("mousedown", handlePointerDown);
+
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  const selectDevice = async (deviceId: string) => {
+    await onChange(deviceId);
+
+    setOpen(false);
+  };
+
+  return (
+    <div className="device-field" ref={dropdownRef}>
+      <span className="field-label">{label}</span>
+
+      <div className={`device-dropdown ${open ? "open" : ""}`}>
+        <button
+          type="button"
+          className="device-dropdown-trigger"
+          onClick={() => setOpen((current) => !current)}
+          aria-expanded={open}
+        >
+          <span className="device-dropdown-value">
+            {selectedDevice?.label || "Select device"}
+          </span>
+
+          <ChevronDown
+            className="device-dropdown-chevron"
+            size={15}
+            strokeWidth={1.8}
+          />
+        </button>
+
+        {open && (
+          <div className="device-dropdown-menu">
+            <div className="device-dropdown-scroll">
+              {devices.length > 0 ? (
+                devices.map((device) => {
+                  const selected = device.deviceId === value;
+
+                  return (
+                    <button
+                      type="button"
+                      className={`device-dropdown-option ${
+                        selected ? "selected" : ""
+                      }`}
+                      key={device.deviceId}
+                      onClick={() => void selectDevice(device.deviceId)}
+                    >
+                      <span>{device.label}</span>
+
+                      {selected && <Check size={14} strokeWidth={2} />}
+                    </button>
+                  );
+                })
+              ) : (
+                <div className="device-dropdown-empty">No devices found</div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function formatKeyName(key: string) {
+  if (key === " ") {
+    return "Space";
+  }
+
+  if (key === "Control") {
+    return "Ctrl";
+  }
+
+  if (key === "Escape") {
+    return "Esc";
+  }
+
+  if (key === "ArrowUp") {
+    return "Up";
+  }
+
+  if (key === "ArrowDown") {
+    return "Down";
+  }
+
+  if (key === "ArrowLeft") {
+    return "Left";
+  }
+
+  if (key === "ArrowRight") {
+    return "Right";
+  }
+
+  if (key.length === 1) {
+    return key.toUpperCase();
+  }
+
+  return key;
+}
+
+function loadPttBinding(): PttBinding {
+  const saved = localStorage.getItem("pttBinding");
+
+  if (saved) {
+    try {
+      const parsed = JSON.parse(saved);
+
+      if (
+        (parsed.type === "keyboard" || parsed.type === "mouse") &&
+        typeof parsed.value === "string"
+      ) {
+        return parsed;
+      }
+    } catch {}
+  }
+
+  const oldKey = localStorage.getItem("pttKey");
+
+  if (oldKey) {
+    return {
+      type: "keyboard",
+
+      value: oldKey,
+    };
+  }
+
+  return {
+    type: "keyboard",
+
+    value: "V",
+  };
+}
+
 function App() {
   const [inputs, setInputs] = useState<Device[]>([]);
+
   const [outputs, setOutputs] = useState<Device[]>([]);
 
   const [selectedInput, setSelectedInput] = useState(
@@ -70,15 +291,24 @@ function App() {
     (localStorage.getItem("voiceMode") as VoiceMode) || "open",
   );
 
+  const [pttBinding, setPttBinding] = useState<PttBinding>(loadPttBinding);
+
+  const [listeningForPttKey, setListeningForPttKey] = useState(false);
+
   const [micLevel, setMicLevel] = useState(0);
+
   const [muted, setMuted] = useState(false);
+
   const [micTestActive, setMicTestActive] = useState(false);
+
   const [isTransmitting, setIsTransmitting] = useState(false);
 
   const [gamePid, setGamePid] = useState<number | null>(null);
 
   const [voiceConnected, setVoiceConnected] = useState(false);
+
   const [voiceConnecting, setVoiceConnecting] = useState(false);
+
   const [reconnecting, setReconnecting] = useState(false);
 
   const [playerPosition, setPlayerPosition] = useState<{
@@ -92,33 +322,114 @@ function App() {
   const [steamId, setSteamId] = useState<string | null>(null);
 
   const [steamVerified, setSteamVerified] = useState(false);
+
   const [steamVerifying, setSteamVerifying] = useState(false);
 
   const [sessionToken, setSessionToken] = useState<string | null>(
     localStorage.getItem("greenlandSession"),
   );
 
+  const [toast, setToast] = useState<ToastState | null>(null);
+
+  const toastTimerRef = useRef<number | null>(null);
+
+  const lastToastRef = useRef<{ message: string; shownAt: number } | null>(
+    null,
+  );
+
   const streamRef = useRef<MediaStream | null>(null);
+
   const animationRef = useRef<number | null>(null);
 
   const roomRef = useRef<Room | null>(null);
 
   const remoteAudioRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+
   const nearbyPlayersRef = useRef<NearbyPlayer[]>([]);
 
   const selectedOutputRef = useRef(selectedOutput);
 
   const mutedRef = useRef(muted);
+
   const voiceModeRef = useRef<VoiceMode>(voiceMode);
+
   const micTestActiveRef = useRef(micTestActive);
 
+  const pttBindingRef = useRef<PttBinding>(pttBinding);
+
+  const listeningForPttRef = useRef(listeningForPttKey);
+
   const micTestContextRef = useRef<AudioContext | null>(null);
+
   const micTestSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+
   const micTestDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(
     null,
   );
 
   const micTestAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  const canConnectVoice =
+    !!steamId &&
+    steamVerified &&
+    !!sessionToken &&
+    !!gamePid &&
+    !!playerPosition;
+
+  const showToast = (
+    type: ToastType,
+    title: string,
+    message: string,
+    duration = 4200,
+  ) => {
+    const now = Date.now();
+    const last = lastToastRef.current;
+
+    if (last && last.message === message && now - last.shownAt < 5000) {
+      return;
+    }
+
+    lastToastRef.current = { message, shownAt: now };
+
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+
+    setToast({
+      id: now,
+      type,
+      title,
+      message,
+    });
+
+    toastTimerRef.current = window.setTimeout(() => {
+      setToast(null);
+      toastTimerRef.current = null;
+    }, duration);
+  };
+
+  const dismissToast = () => {
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+
+    setToast(null);
+  };
+
+  const getErrorMessage = (error: unknown, fallback: string) => {
+    return error instanceof Error && error.message ? error.message : fallback;
+  };
+
+  const savePttBinding = (binding: PttBinding) => {
+    setPttBinding(binding);
+
+    pttBindingRef.current = binding;
+
+    localStorage.setItem("pttBinding", JSON.stringify(binding));
+
+    localStorage.removeItem("pttKey");
+  };
 
   const applyRemoteVolumes = () => {
     const nearby = nearbyPlayersRef.current;
@@ -133,7 +444,9 @@ function App() {
   const cleanupRemoteAudio = () => {
     for (const audio of remoteAudioRef.current.values()) {
       audio.pause();
+
       audio.srcObject = null;
+
       audio.remove();
     }
 
@@ -144,6 +457,7 @@ function App() {
     localStorage.removeItem("greenlandSession");
 
     setSessionToken(null);
+
     setSteamVerified(false);
   };
 
@@ -152,14 +466,17 @@ function App() {
 
     if (!room) {
       setIsTransmitting(false);
+
       return;
     }
 
     try {
       await room.localParticipant.setMicrophoneEnabled(enabled);
+
       setIsTransmitting(enabled);
     } catch (error) {
       console.error("Unable to change microphone state:", error);
+
       setIsTransmitting(false);
     }
   };
@@ -181,6 +498,14 @@ function App() {
   }, [selectedOutput]);
 
   useEffect(() => {
+    pttBindingRef.current = pttBinding;
+  }, [pttBinding]);
+
+  useEffect(() => {
+    listeningForPttRef.current = listeningForPttKey;
+  }, [listeningForPttKey]);
+
+  useEffect(() => {
     const loadDevices = async () => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -193,6 +518,7 @@ function App() {
           .filter((device) => device.kind === "audioinput")
           .map((device) => ({
             deviceId: device.deviceId,
+
             label: device.label || "Microphone",
           }));
 
@@ -200,10 +526,12 @@ function App() {
           .filter((device) => device.kind === "audiooutput")
           .map((device) => ({
             deviceId: device.deviceId,
+
             label: device.label || "Output Device",
           }));
 
         setInputs(inputDevices);
+
         setOutputs(outputDevices);
 
         if (!selectedInput && inputDevices.length > 0) {
@@ -217,6 +545,17 @@ function App() {
         stream.getTracks().forEach((track) => track.stop());
       } catch (error) {
         console.error("Unable to load audio devices:", error);
+
+        const permissionDenied =
+          error instanceof DOMException && error.name === "NotAllowedError";
+
+        showToast(
+          "error",
+          "Microphone unavailable",
+          permissionDenied
+            ? "Microphone permission was denied. Allow microphone access and restart Greenland Voice."
+            : "Greenland Voice couldn't load your audio devices.",
+        );
       }
     };
 
@@ -224,7 +563,9 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!selectedInput) return;
+    if (!selectedInput) {
+      return;
+    }
 
     let audioContext: AudioContext | null = null;
 
@@ -245,6 +586,7 @@ function App() {
         audioContext = new AudioContext();
 
         const source = audioContext.createMediaStreamSource(stream);
+
         const analyser = audioContext.createAnalyser();
 
         analyser.fftSize = 256;
@@ -267,6 +609,12 @@ function App() {
         updateLevel();
       } catch (error) {
         console.error("Unable to start microphone:", error);
+
+        showToast(
+          "error",
+          "Microphone unavailable",
+          "The selected microphone couldn't be started. Try selecting another microphone.",
+        );
       }
     };
 
@@ -329,16 +677,29 @@ function App() {
         if (!response.ok) {
           clearSession();
 
+          showToast(
+            "info",
+            "Steam verification expired",
+            "Verify with Steam again to continue using Greenland Voice.",
+          );
+
           return;
         }
 
         const data = (await response.json()) as {
           authenticated: boolean;
+
           steamId?: string;
         };
 
         if (!data.authenticated || !data.steamId || data.steamId !== steamId) {
           clearSession();
+
+          showToast(
+            "error",
+            "Steam account mismatch",
+            "Your verified Steam session doesn't match the Steam account detected on this PC.",
+          );
 
           return;
         }
@@ -346,6 +707,12 @@ function App() {
         setSteamVerified(true);
       } catch (error) {
         console.error("Unable to validate Steam session:", error);
+
+        showToast(
+          "error",
+          "Backend unavailable",
+          "Greenland Voice couldn't reach the server. Check your connection and try again.",
+        );
       }
     };
 
@@ -353,7 +720,9 @@ function App() {
   }, [sessionToken, steamId]);
 
   const verifySteam = async () => {
-    if (!steamId || steamVerifying) return;
+    if (!steamId || steamVerifying) {
+      return;
+    }
 
     try {
       setSteamVerifying(true);
@@ -368,12 +737,14 @@ function App() {
 
       const data = (await response.json()) as {
         authId: string;
+
         url: string;
       };
 
       await openUrl(data.url);
 
       const startedAt = Date.now();
+
       const timeout = 5 * 60 * 1000;
 
       while (Date.now() - startedAt < timeout) {
@@ -395,7 +766,9 @@ function App() {
 
         const status = (await statusResponse.json()) as {
           status: string;
+
           token?: string;
+
           steamId?: string;
         };
 
@@ -410,7 +783,14 @@ function App() {
         localStorage.setItem("greenlandSession", status.token);
 
         setSessionToken(status.token);
+
         setSteamVerified(true);
+
+        showToast(
+          "success",
+          "Steam verified",
+          "Your Steam account is now connected to Greenland Voice.",
+        );
 
         return;
       }
@@ -418,8 +798,56 @@ function App() {
       throw new Error("Steam verification timed out");
     } catch (error) {
       console.error("Steam verification failed:", error);
+
+      showToast(
+        "error",
+        "Steam verification failed",
+        getErrorMessage(error, "Steam verification couldn't be completed."),
+      );
     } finally {
       setSteamVerifying(false);
+    }
+  };
+
+  const logoutSteam = async () => {
+    try {
+      await setLiveKitMic(false);
+
+      roomRef.current?.disconnect();
+
+      roomRef.current = null;
+
+      cleanupRemoteAudio();
+
+      setVoiceConnected(false);
+
+      setIsTransmitting(false);
+
+      if (sessionToken) {
+        await fetch(`${API_URL}/auth/logout`, {
+          method: "POST",
+
+          headers: {
+            Authorization: `Bearer ${sessionToken}`,
+          },
+        });
+      }
+    } catch (error) {
+      console.error("Unable to log out:", error);
+    } finally {
+      clearSession();
+
+      setPlayerPosition(null);
+
+      setNearbyPlayers([]);
+
+      nearbyPlayersRef.current = [];
+
+      showToast(
+        "success",
+        "Logged out",
+        "You've been logged out of Greenland Voice.",
+      );
     }
   };
 
@@ -428,6 +856,7 @@ function App() {
       nearbyPlayersRef.current = [];
 
       setNearbyPlayers([]);
+
       setPlayerPosition(null);
 
       applyRemoteVolumes();
@@ -436,7 +865,9 @@ function App() {
     }
 
     let socket: WebSocket | null = null;
+
     let reconnectTimer: number | null = null;
+
     let stopped = false;
 
     const connectSocket = () => {
@@ -446,6 +877,7 @@ function App() {
         socket?.send(
           JSON.stringify({
             type: "auth",
+
             token: sessionToken,
           }),
         );
@@ -468,7 +900,9 @@ function App() {
           if (snapshot.self) {
             setPlayerPosition({
               x: Number(snapshot.self.x),
+
               y: Number(snapshot.self.y),
+
               z: Number(snapshot.self.z),
             });
           } else {
@@ -494,6 +928,12 @@ function App() {
       socket.onclose = (event) => {
         if (event.code === 4001) {
           clearSession();
+
+          showToast(
+            "info",
+            "Session expired",
+            "Your Greenland Voice session expired. Verify with Steam again.",
+          );
 
           return;
         }
@@ -526,18 +966,121 @@ function App() {
   }, [nearbyPlayers]);
 
   useEffect(() => {
-    if (voiceMode !== "ptt") return;
+    if (!listeningForPttKey) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (event.repeat) {
+        return;
+      }
+
+      if (event.key === "Escape") {
+        setListeningForPttKey(false);
+
+        return;
+      }
+
+      const key = formatKeyName(event.key);
+
+      savePttBinding({
+        type: "keyboard",
+
+        value: key,
+      });
+
+      setListeningForPttKey(false);
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [listeningForPttKey]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    listen<string>("ptt-mouse", (event) => {
+      const [button, state] = event.payload.split(":");
+
+      if (button !== "Mouse4" && button !== "Mouse5") {
+        return;
+      }
+
+      if (listeningForPttRef.current) {
+        if (state === "pressed") {
+          savePttBinding({
+            type: "mouse",
+
+            value: button,
+          });
+
+          setListeningForPttKey(false);
+        }
+
+        return;
+      }
+
+      const binding = pttBindingRef.current;
+
+      if (
+        voiceModeRef.current !== "ptt" ||
+        binding.type !== "mouse" ||
+        binding.value !== button
+      ) {
+        return;
+      }
+
+      if (state === "pressed") {
+        if (mutedRef.current || micTestActiveRef.current || !roomRef.current) {
+          return;
+        }
+
+        void setLiveKitMic(true);
+
+        return;
+      }
+
+      if (state === "released") {
+        void setLiveKitMic(false);
+      }
+    }).then((stop) => {
+      unlisten = stop;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (
+      voiceMode !== "ptt" ||
+      listeningForPttKey ||
+      pttBinding.type !== "keyboard"
+    ) {
+      return;
+    }
 
     let active = true;
+
+    const shortcut = pttBinding.value;
 
     const setupShortcut = async () => {
       try {
         try {
-          await unregister("V");
+          await unregister(shortcut);
         } catch {}
 
-        await register("V", (event) => {
-          if (!active) return;
+        await register(shortcut, (event) => {
+          if (!active) {
+            return;
+          }
 
           if (event.state === "Pressed") {
             if (
@@ -557,6 +1100,12 @@ function App() {
         });
       } catch (error) {
         console.error("Unable to register Push to Talk:", error);
+
+        showToast(
+          "error",
+          "Push to Talk unavailable",
+          `The ${shortcut} key couldn't be registered. Choose a different PTT key.`,
+        );
       }
     };
 
@@ -565,16 +1114,20 @@ function App() {
     return () => {
       active = false;
 
-      unregister("V").catch(() => {});
+      unregister(shortcut).catch(() => {});
 
-      if (voiceModeRef.current === "ptt") {
-        void setLiveKitMic(false);
-      }
+      void setLiveKitMic(false);
     };
-  }, [voiceMode]);
+  }, [voiceMode, pttBinding, listeningForPttKey]);
 
   const startVoiceConnection = async () => {
-    if (!steamId || !steamVerified || !sessionToken) {
+    if (
+      !steamId ||
+      !steamVerified ||
+      !sessionToken ||
+      !gamePid ||
+      !playerPosition
+    ) {
       return;
     }
 
@@ -587,15 +1140,22 @@ function App() {
     if (!response.ok) {
       if (response.status === 401) {
         clearSession();
+
+        throw new Error("Your Steam session expired. Verify with Steam again.");
       }
 
-      const error = await response.text();
+      if (response.status === 403) {
+        throw new Error(
+          "Join Greenland PH in The Isle before connecting to voice.",
+        );
+      }
 
-      throw new Error(`Token request failed: ${response.status} ${error}`);
+      throw new Error("The voice server couldn't authorize your connection.");
     }
 
     const data = (await response.json()) as {
       serverUrl: string;
+
       token: string;
     };
 
@@ -609,6 +1169,7 @@ function App() {
       cleanupRemoteAudio();
 
       setVoiceConnected(false);
+
       setIsTransmitting(false);
 
       if (roomRef.current === room) {
@@ -618,6 +1179,12 @@ function App() {
 
     room.on(RoomEvent.MediaDevicesError, (error) => {
       console.error("LiveKit media device error:", error);
+
+      showToast(
+        "error",
+        "Audio device error",
+        "Live voice lost access to your microphone. Check the selected device and permissions.",
+      );
     });
 
     room.on(
@@ -633,7 +1200,9 @@ function App() {
 
         if (existingAudio) {
           existingAudio.pause();
+
           existingAudio.srcObject = null;
+
           existingAudio.remove();
         }
 
@@ -644,7 +1213,9 @@ function App() {
         }
 
         element.autoplay = true;
+
         element.volume = 0;
+
         element.style.display = "none";
 
         const outputDevice = selectedOutputRef.current;
@@ -654,6 +1225,12 @@ function App() {
             await element.setSinkId(outputDevice);
           } catch (error) {
             console.error("Unable to route remote voice output:", error);
+
+            showToast(
+              "error",
+              "Output device unavailable",
+              "Remote voice couldn't be routed to the selected output device.",
+            );
           }
         }
 
@@ -682,7 +1259,9 @@ function App() {
 
       if (element) {
         element.pause();
+
         element.srcObject = null;
+
         element.remove();
 
         remoteAudioRef.current.delete(remoteSteamId);
@@ -714,21 +1293,23 @@ function App() {
   };
 
   const connectVoice = async () => {
-    if (!steamId || !steamVerified || !sessionToken || voiceConnecting) {
-      return;
-    }
-
     if (roomRef.current) {
       await setLiveKitMic(false);
 
       roomRef.current.disconnect();
+
       roomRef.current = null;
 
       cleanupRemoteAudio();
 
       setVoiceConnected(false);
+
       setIsTransmitting(false);
 
+      return;
+    }
+
+    if (!canConnectVoice || voiceConnecting) {
       return;
     }
 
@@ -739,12 +1320,23 @@ function App() {
     } catch (error) {
       console.error("Unable to connect to Greenland voice:", error);
 
+      showToast(
+        "error",
+        "Voice connection failed",
+        getErrorMessage(
+          error,
+          "Greenland Voice couldn't connect. Check your connection and try again.",
+        ),
+      );
+
       roomRef.current?.disconnect();
+
       roomRef.current = null;
 
       cleanupRemoteAudio();
 
       setVoiceConnected(false);
+
       setIsTransmitting(false);
     } finally {
       setVoiceConnecting(false);
@@ -752,7 +1344,7 @@ function App() {
   };
 
   const reconnectVoice = async () => {
-    if (!steamId || !steamVerified || !sessionToken || reconnecting) {
+    if (!canConnectVoice || reconnecting) {
       return;
     }
 
@@ -762,23 +1354,36 @@ function App() {
       await setLiveKitMic(false);
 
       roomRef.current?.disconnect();
+
       roomRef.current = null;
 
       cleanupRemoteAudio();
 
       setVoiceConnected(false);
+
       setIsTransmitting(false);
 
       await startVoiceConnection();
     } catch (error) {
       console.error("Unable to reconnect voice:", error);
 
+      showToast(
+        "error",
+        "Reconnect failed",
+        getErrorMessage(
+          error,
+          "Greenland Voice couldn't reconnect. Check your connection and try again.",
+        ),
+      );
+
       roomRef.current?.disconnect();
+
       roomRef.current = null;
 
       cleanupRemoteAudio();
 
       setVoiceConnected(false);
+
       setIsTransmitting(false);
     } finally {
       setReconnecting(false);
@@ -787,6 +1392,7 @@ function App() {
 
   const changeVoiceMode = async (mode: VoiceMode) => {
     setVoiceMode(mode);
+
     voiceModeRef.current = mode;
 
     localStorage.setItem("voiceMode", mode);
@@ -816,9 +1422,11 @@ function App() {
     micTestAudioRef.current = null;
 
     micTestSourceRef.current?.disconnect();
+
     micTestSourceRef.current = null;
 
     micTestDestinationRef.current?.disconnect();
+
     micTestDestinationRef.current = null;
 
     if (micTestContextRef.current) {
@@ -828,6 +1436,7 @@ function App() {
     }
 
     setMicTestActive(false);
+
     micTestActiveRef.current = false;
 
     if (
@@ -842,7 +1451,9 @@ function App() {
   };
 
   const startMicTest = async () => {
-    if (!streamRef.current) return;
+    if (!streamRef.current) {
+      return;
+    }
 
     try {
       micTestActiveRef.current = true;
@@ -870,11 +1481,20 @@ function App() {
       await audio.play();
 
       micTestContextRef.current = context;
+
       micTestSourceRef.current = source;
+
       micTestDestinationRef.current = destination;
+
       micTestAudioRef.current = audio;
     } catch (error) {
       console.error("Unable to start microphone test:", error);
+
+      showToast(
+        "error",
+        "Mic test failed",
+        "Greenland Voice couldn't start the microphone test with the selected devices.",
+      );
 
       micTestActiveRef.current = false;
 
@@ -910,6 +1530,7 @@ function App() {
 
   const changeOutput = async (deviceId: string) => {
     setSelectedOutput(deviceId);
+
     selectedOutputRef.current = deviceId;
 
     localStorage.setItem("audioOutput", deviceId);
@@ -937,6 +1558,7 @@ function App() {
     const nextMuted = !muted;
 
     setMuted(nextMuted);
+
     mutedRef.current = nextMuted;
 
     if (nextMuted) {
@@ -957,18 +1579,30 @@ function App() {
       await openUrl(SUPPORT_URL);
     } catch (error) {
       console.error("Unable to open Discord support:", error);
+
+      showToast(
+        "error",
+        "Couldn't open Discord",
+        "The support link couldn't be opened.",
+      );
     }
   };
 
   useEffect(() => {
     return () => {
+      if (toastTimerRef.current !== null) {
+        window.clearTimeout(toastTimerRef.current);
+      }
+
       micTestAudioRef.current?.pause();
 
       if (micTestContextRef.current) {
         micTestContextRef.current.close();
       }
 
-      unregister("V").catch(() => {});
+      if (pttBindingRef.current.type === "keyboard") {
+        unregister(pttBindingRef.current.value).catch(() => {});
+      }
 
       cleanupRemoteAudio();
 
@@ -985,7 +1619,7 @@ function App() {
           <div>
             <div className="brand-title">Greenland Voice</div>
 
-            <div className="brand-subtitle">PROXIMITY VOICE</div>
+            <div className="brand-subtitle">v.1.0.0</div>
           </div>
         </div>
 
@@ -1018,15 +1652,42 @@ function App() {
             </button>
           )}
 
-          <button
-            className="restart-button"
-            onClick={reconnectVoice}
-            disabled={
-              reconnecting || voiceConnecting || !steamVerified || !sessionToken
-            }
-          >
-            ↻ {reconnecting ? "Reconnecting" : "Reconnect"}
-          </button>
+          <div className="header-tooltip-parent">
+            <button
+              className={`header-icon-button ${reconnecting ? "spinning" : ""}`}
+              onClick={reconnectVoice}
+              disabled={reconnecting || voiceConnecting || !canConnectVoice}
+              aria-label="Reconnect Voice"
+            >
+              <RotateCw size={16} strokeWidth={1.8} />
+            </button>
+
+            <HeaderTooltip
+              title="Reconnect Voice"
+              body={
+                canConnectVoice
+                  ? "Reconnect to the voice server."
+                  : "Join Greenland PH before reconnecting."
+              }
+            />
+          </div>
+
+          {steamVerified && (
+            <div className="header-tooltip-parent">
+              <button
+                className="header-icon-button logout-icon-button"
+                onClick={logoutSteam}
+                aria-label="Log out"
+              >
+                <LogOut size={16} strokeWidth={1.8} />
+              </button>
+
+              <HeaderTooltip
+                title="Log out"
+                body="Log out of Greenland Voice. This does not sign you out of Steam."
+              />
+            </div>
+          )}
 
           {voiceConnected && (
             <button className="stop-button" onClick={connectVoice}>
@@ -1092,8 +1753,10 @@ function App() {
             }
             body={
               playerPosition
-                ? "Your coordinates are updating."
-                : "Join Greenland PH to begin proximity tracking."
+                ? "You are connected to Greenland PH and your position is updating."
+                : gamePid
+                  ? "Join Greenland PH to begin proximity tracking."
+                  : "Launch The Isle and join Greenland PH."
             }
           />
         </div>
@@ -1125,6 +1788,7 @@ function App() {
               onClick={() => changeVoiceMode("open")}
             >
               <strong>Open Mic</strong>
+
               <span>Always transmit</span>
             </button>
 
@@ -1133,7 +1797,8 @@ function App() {
               onClick={() => changeVoiceMode("ptt")}
             >
               <strong>Push to Talk</strong>
-              <span>Hold V to speak</span>
+
+              <span>Hold your key to speak</span>
             </button>
           </div>
 
@@ -1142,43 +1807,38 @@ function App() {
               <div>
                 <strong>Push to Talk Key</strong>
 
-                <span>Works while The Isle is focused</span>
+                <span>
+                  {listeningForPttKey
+                    ? "Press a keyboard key or mouse side button — Esc to cancel"
+                    : "Click the key to change it"}
+                </span>
               </div>
 
-              <kbd>V</kbd>
+              <button
+                className={`ptt-key-button ${
+                  listeningForPttKey ? "listening" : ""
+                }`}
+                onClick={() => setListeningForPttKey(true)}
+              >
+                {listeningForPttKey ? "..." : pttBinding.value}
+              </button>
             </div>
           )}
 
           <div className="device-grid">
-            <label>
-              <span className="field-label">Microphone</span>
+            <DeviceDropdown
+              label="Microphone"
+              devices={inputs}
+              value={selectedInput}
+              onChange={changeInput}
+            />
 
-              <select
-                value={selectedInput}
-                onChange={(event) => changeInput(event.target.value)}
-              >
-                {inputs.map((device) => (
-                  <option key={device.deviceId} value={device.deviceId}>
-                    {device.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              <span className="field-label">Output Device</span>
-
-              <select
-                value={selectedOutput}
-                onChange={(event) => changeOutput(event.target.value)}
-              >
-                {outputs.map((device) => (
-                  <option key={device.deviceId} value={device.deviceId}>
-                    {device.label}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <DeviceDropdown
+              label="Output Device"
+              devices={outputs}
+              value={selectedOutput}
+              onChange={changeOutput}
+            />
           </div>
 
           <div className="mic-controls">
@@ -1242,21 +1902,28 @@ function App() {
               <div className="coordinates">
                 <div>
                   <span>X</span>
+
                   <strong>{playerPosition.x.toFixed(0)}</strong>
                 </div>
 
                 <div>
                   <span>Y</span>
+
                   <strong>{playerPosition.y.toFixed(0)}</strong>
                 </div>
 
                 <div>
                   <span>Z</span>
+
                   <strong>{playerPosition.z.toFixed(0)}</strong>
                 </div>
               </div>
             ) : (
-              <div className="empty-box">Waiting for player position</div>
+              <div className="empty-box">
+                {!gamePid
+                  ? "Launch The Isle"
+                  : "Join Greenland PH to begin tracking"}
+              </div>
             )}
           </section>
 
@@ -1274,12 +1941,7 @@ function App() {
               <button
                 className="utility-button"
                 onClick={reconnectVoice}
-                disabled={
-                  reconnecting ||
-                  voiceConnecting ||
-                  !steamVerified ||
-                  !sessionToken
-                }
+                disabled={reconnecting || voiceConnecting || !canConnectVoice}
               >
                 Reconnect
               </button>
@@ -1314,7 +1976,11 @@ function App() {
             ))
           ) : (
             <div className="players-empty">
-              No players currently in voice range
+              {!gamePid
+                ? "Launch The Isle to use proximity voice"
+                : !playerPosition
+                  ? "Join Greenland PH to see nearby players"
+                  : "No players currently in voice range"}
             </div>
           )}
         </div>
@@ -1324,20 +1990,48 @@ function App() {
         <button
           className="connect-button"
           onClick={connectVoice}
-          disabled={
-            voiceConnecting ||
-            reconnecting ||
-            !steamId ||
-            !steamVerified ||
-            !sessionToken
-          }
+          disabled={voiceConnecting || reconnecting || !canConnectVoice}
         >
           {!steamVerified
             ? "Verify Steam to Connect"
-            : voiceConnecting
-              ? "Connecting..."
-              : "Connect Voice"}
+            : !gamePid
+              ? "Launch The Isle to Connect"
+              : !playerPosition
+                ? "Join Greenland PH to Connect"
+                : voiceConnecting
+                  ? "Connecting..."
+                  : "Connect Voice"}
         </button>
+      )}
+
+      {toast && (
+        <div className="toast-region" role="status" aria-live="polite">
+          <div className={`app-toast ${toast.type}`} key={toast.id}>
+            <div className="toast-icon" aria-hidden="true">
+              {toast.type === "error" ? (
+                <AlertCircle size={17} strokeWidth={1.9} />
+              ) : toast.type === "success" ? (
+                <CheckCircle2 size={17} strokeWidth={1.9} />
+              ) : (
+                <Info size={17} strokeWidth={1.9} />
+              )}
+            </div>
+
+            <div className="toast-copy">
+              <strong>{toast.title}</strong>
+              <span>{toast.message}</span>
+            </div>
+
+            <button
+              type="button"
+              className="toast-close"
+              onClick={dismissToast}
+              aria-label="Dismiss notification"
+            >
+              <X size={14} strokeWidth={1.8} />
+            </button>
+          </div>
+        </div>
       )}
     </main>
   );
