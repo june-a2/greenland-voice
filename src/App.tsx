@@ -179,105 +179,120 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const socket = new WebSocket("wss://greenland-voice.onrender.com/ws");
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
+    let stopped = false;
 
-    socket.onopen = () => {
-      console.log("Connected to Greenland backend");
-      setBackendConnected(true);
-    };
+    const connectBackend = () => {
+      socket = new WebSocket("wss://greenland-voice.onrender.com/ws");
 
-    socket.onerror = (error) => {
-      console.error("Greenland backend WebSocket error:", error);
-      setBackendConnected(false);
-    };
+      socket.onopen = () => {
+        console.log("Connected to Greenland backend");
+        setBackendConnected(true);
+      };
 
-    socket.onclose = () => {
-      console.log("Disconnected from Greenland backend");
-      setBackendConnected(false);
-    };
+      socket.onerror = (error) => {
+        console.error("Greenland backend WebSocket error:", error);
+      };
 
-    socket.onmessage = (event) => {
-      console.log("Backend message:", event.data);
+      socket.onclose = () => {
+        console.log("Disconnected from Greenland backend");
+        setBackendConnected(false);
 
-      const data = JSON.parse(event.data);
+        if (!stopped) {
+          reconnectTimer = window.setTimeout(() => {
+            console.log("Reconnecting to Greenland backend...");
+            connectBackend();
+          }, 3000);
+        }
+      };
 
-      if (data.type === "players" && data.players.length > 0) {
-        const player = data.players.find(
-          (player: { steamId: string }) => player.steamId === STEAM_ID,
-        );
+      socket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
 
-        if (player) {
-          setPlayerPosition({
-            x: player.x,
-            y: player.y,
-            z: player.z,
-          });
+        if (data.type === "players" && data.players.length > 0) {
+          const player = data.players.find(
+            (player: { steamId: string }) => player.steamId === STEAM_ID,
+          );
 
-          const others = data.players
-            .filter((other: { steamId: string }) => other.steamId !== STEAM_ID)
-            .map(
-              (other: {
-                name: string;
-                steamId: string;
-                x: number;
-                y: number;
-                z: number;
-              }) => {
-                const dx = player.x - other.x;
-                const dy = player.y - other.y;
-                const dz = player.z - other.z;
+          if (player) {
+            setPlayerPosition({
+              x: player.x,
+              y: player.y,
+              z: player.z,
+            });
 
-                const rawDistance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            const others = data.players
+              .filter(
+                (other: { steamId: string }) => other.steamId !== STEAM_ID,
+              )
+              .map(
+                (other: {
+                  name: string;
+                  steamId: string;
+                  x: number;
+                  y: number;
+                  z: number;
+                }) => {
+                  const dx = player.x - other.x;
+                  const dy = player.y - other.y;
+                  const dz = player.z - other.z;
 
-                const maxVoiceDistance = 5000;
+                  const rawDistance = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
-                const normalizedDistance = Math.min(
-                  rawDistance / maxVoiceDistance,
-                  1,
-                );
+                  const maxVoiceDistance = 5000;
 
-                const volume = Math.pow(1 - normalizedDistance, 1.6);
+                  const normalizedDistance = Math.min(
+                    rawDistance / maxVoiceDistance,
+                    1,
+                  );
 
-                return {
-                  name: other.name,
-                  steamId: other.steamId,
-                  distance: rawDistance,
+                  const volume = Math.pow(1 - normalizedDistance, 1.6);
+
+                  return {
+                    name: other.name,
+                    steamId: other.steamId,
+                    distance: rawDistance,
+                    volume,
+                  };
+                },
+              )
+              .filter((player: { volume: number }) => player.volume > 0);
+
+            setNearbyPlayers(others);
+
+            if (testMode) {
+              const fakeDistance = Math.abs(fakePlayerOffset);
+
+              const normalizedDistance = Math.min(fakeDistance / 5000, 1);
+
+              const volume = Math.pow(1 - normalizedDistance, 1.6);
+
+              setNearbyPlayers([
+                ...others,
+                {
+                  name: "Test Player",
+                  steamId: "test-player",
+                  distance: fakeDistance,
                   volume,
-                };
-              },
-            )
-            .filter((player: { volume: number }) => player.volume > 0);
-
-          setNearbyPlayers(others);
-
-          if (testMode && player) {
-            const fakeDistance = Math.abs(fakePlayerOffset);
-
-            const maxVoiceDistance = 5000;
-
-            const normalizedDistance = Math.min(
-              fakeDistance / maxVoiceDistance,
-              1,
-            );
-
-            const volume = Math.pow(1 - normalizedDistance, 1.6);
-
-            setNearbyPlayers([
-              ...others,
-              {
-                name: "Test Player",
-                steamId: "test-player",
-                distance: fakeDistance,
-                volume,
-              },
-            ]);
+                },
+              ]);
+            }
           }
         }
-      }
+      };
     };
 
+    connectBackend();
+
     return () => {
-      socket.close();
+      stopped = true;
+
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+
+      socket?.close();
     };
   }, []);
 
