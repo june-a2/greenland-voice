@@ -2,14 +2,24 @@ import "dotenv/config";
 import net from "node:net";
 import http from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
+import { AccessToken } from "livekit-server-sdk";
 
 const RCON_HOST = process.env.RCON_HOST;
 const RCON_PORT = Number(process.env.RCON_PORT);
 const RCON_PASSWORD = process.env.RCON_PASSWORD;
+
+const LIVEKIT_URL = process.env.LIVEKIT_URL;
+const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
+const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
+
 const PORT = Number(process.env.PORT) || 8787;
 
 if (!RCON_HOST || !RCON_PORT || !RCON_PASSWORD) {
   throw new Error("Missing RCON configuration");
+}
+
+if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
+  throw new Error("Missing LiveKit configuration");
 }
 
 function parsePlayers(text: string) {
@@ -42,7 +52,7 @@ let currentPlayers: ReturnType<typeof parsePlayers> = [];
 console.log("Greenland backend starting...");
 console.log(`RCON target: ${RCON_HOST}:${RCON_PORT}`);
 
-const httpServer = http.createServer((req, res) => {
+const httpServer = http.createServer(async (req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, {
       "Content-Type": "application/json",
@@ -56,6 +66,88 @@ const httpServer = http.createServer((req, res) => {
     );
 
     return;
+  }
+
+  if (req.url?.startsWith("/livekit-token")) {
+    try {
+      const url = new URL(req.url, `http://${req.headers.host}`);
+
+      const steamId = url.searchParams.get("steamId");
+
+      if (!steamId) {
+        res.writeHead(400, {
+          "Content-Type": "application/json",
+        });
+
+        res.end(
+          JSON.stringify({
+            error: "Missing steamId",
+          }),
+        );
+
+        return;
+      }
+
+      const player = currentPlayers.find(
+        (player) => player.steamId === steamId,
+      );
+
+      if (!player) {
+        res.writeHead(403, {
+          "Content-Type": "application/json",
+        });
+
+        res.end(
+          JSON.stringify({
+            error: "Player is not currently on the server",
+          }),
+        );
+
+        return;
+      }
+
+      const token = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+        identity: steamId,
+        name: player.name,
+      });
+
+      token.addGrant({
+        roomJoin: true,
+        room: "greenland-voice",
+        canPublish: true,
+        canSubscribe: true,
+      });
+
+      const participantToken = await token.toJwt();
+
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      });
+
+      res.end(
+        JSON.stringify({
+          serverUrl: LIVEKIT_URL,
+          token: participantToken,
+        }),
+      );
+
+      return;
+    } catch (error) {
+      console.error("LiveKit token error:", error);
+
+      res.writeHead(500, {
+        "Content-Type": "application/json",
+      });
+
+      res.end(
+        JSON.stringify({
+          error: "Unable to create LiveKit token",
+        }),
+      );
+
+      return;
+    }
   }
 
   res.writeHead(200, {
@@ -130,12 +222,6 @@ socket.on("data", (data) => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(message);
       }
-    }
-
-    for (const player of currentPlayers) {
-      console.log(
-        `${player.name} | ${player.className} | X:${player.x} Y:${player.y} Z:${player.z}`,
-      );
     }
   }
 

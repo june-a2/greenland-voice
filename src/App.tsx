@@ -39,7 +39,7 @@ function App() {
     }[]
   >([]);
 
-  const STEAM_ID = "76561199083876638";
+  const [steamId, setSteamId] = useState<string | null>(null);
 
   const [testMode, setTestMode] = useState(false);
   const [testPan, setTestPan] = useState(0);
@@ -173,12 +173,23 @@ function App() {
 
     checkGame();
 
+    invoke<string | null>("get_steam_id")
+      .then((detectedSteamId) => {
+        console.log("Detected SteamID:", detectedSteamId);
+        setSteamId(detectedSteamId);
+      })
+      .catch((error) => {
+        console.error("SteamID detection failed:", error);
+      });
+
     const interval = setInterval(checkGame, 3000);
 
     return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
+    if (!steamId) return;
+
     let socket: WebSocket | null = null;
     let reconnectTimer: number | null = null;
     let stopped = false;
@@ -212,20 +223,23 @@ function App() {
 
         if (data.type === "players" && data.players.length > 0) {
           const player = data.players.find(
-            (player: { steamId: string }) => player.steamId === STEAM_ID,
+            (player: { steamId: string }) => player.steamId === steamId,
           );
 
           if (player) {
+            const x = Number(player.x);
+            const y = Number(player.y);
+            const z = Number(player.z);
+
             setPlayerPosition({
-              x: player.x,
-              y: player.y,
-              z: player.z,
+              x,
+              y,
+              z,
             });
 
             const others = data.players
-              .filter(
-                (other: { steamId: string }) => other.steamId !== STEAM_ID,
-              )
+
+              .filter((other: { steamId: string }) => other.steamId !== steamId)
               .map(
                 (other: {
                   name: string;
@@ -294,7 +308,7 @@ function App() {
 
       socket?.close();
     };
-  }, []);
+  }, [steamId]);
 
   const changeInput = (deviceId: string) => {
     setSelectedInput(deviceId);
