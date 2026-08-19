@@ -53,6 +53,15 @@ console.log("Greenland backend starting...");
 console.log(`RCON target: ${RCON_HOST}:${RCON_PORT}`);
 
 const httpServer = http.createServer(async (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
   if (req.url === "/health") {
     res.writeHead(200, {
       "Content-Type": "application/json",
@@ -122,7 +131,6 @@ const httpServer = http.createServer(async (req, res) => {
 
       res.writeHead(200, {
         "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
       });
 
       res.end(

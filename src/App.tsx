@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Room, RoomEvent } from "livekit-client";
 import "./App.css";
 
 type Device = {
@@ -23,6 +24,8 @@ function App() {
   const [muted, setMuted] = useState(false);
   const [gamePid, setGamePid] = useState<number | null>(null);
   const [backendConnected, setBackendConnected] = useState(false);
+  const [voiceConnected, setVoiceConnected] = useState(false);
+  const [voiceConnecting, setVoiceConnecting] = useState(false);
 
   const [playerPosition, setPlayerPosition] = useState<{
     x: number;
@@ -47,6 +50,8 @@ function App() {
 
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
+
+  const roomRef = useRef<Room | null>(null);
 
   const testAudioContextRef = useRef<AudioContext | null>(null);
   const testSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -213,6 +218,7 @@ function App() {
         if (!stopped) {
           reconnectTimer = window.setTimeout(() => {
             console.log("Reconnecting to Greenland backend...");
+
             connectBackend();
           }, 3000);
         }
@@ -238,7 +244,6 @@ function App() {
             });
 
             const others = data.players
-
               .filter((other: { steamId: string }) => other.steamId !== steamId)
               .map(
                 (other: {
@@ -248,9 +253,9 @@ function App() {
                   y: number;
                   z: number;
                 }) => {
-                  const dx = player.x - other.x;
-                  const dy = player.y - other.y;
-                  const dz = player.z - other.z;
+                  const dx = x - Number(other.x);
+                  const dy = y - Number(other.y);
+                  const dz = z - Number(other.z);
 
                   const rawDistance = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
@@ -310,9 +315,95 @@ function App() {
     };
   }, [steamId]);
 
-  const changeInput = (deviceId: string) => {
+  const connectVoice = async () => {
+    if (!steamId) {
+      console.error("Cannot connect voice: SteamID missing");
+      return;
+    }
+
+    if (voiceConnecting) return;
+
+    if (roomRef.current) {
+      roomRef.current.disconnect();
+      roomRef.current = null;
+      setVoiceConnected(false);
+      return;
+    }
+
+    try {
+      setVoiceConnecting(true);
+
+      const response = await fetch(
+        `https://greenland-voice.onrender.com/livekit-token?steamId=${encodeURIComponent(
+          steamId,
+        )}`,
+      );
+
+      if (!response.ok) {
+        const error = await response.text();
+
+        throw new Error(`Token request failed: ${response.status} ${error}`);
+      }
+
+      const data = (await response.json()) as {
+        serverUrl: string;
+        token: string;
+      };
+
+      const room = new Room();
+
+      room.on(RoomEvent.Connected, () => {
+        console.log("Connected to Greenland voice");
+        setVoiceConnected(true);
+      });
+
+      room.on(RoomEvent.Disconnected, () => {
+        console.log("Disconnected from Greenland voice");
+        setVoiceConnected(false);
+        roomRef.current = null;
+      });
+
+      room.on(RoomEvent.MediaDevicesError, (error) => {
+        console.error("LiveKit media device error:", error);
+      });
+
+      roomRef.current = room;
+
+      await room.connect(data.serverUrl, data.token);
+
+      if (selectedInput) {
+        await room.switchActiveDevice("audioinput", selectedInput);
+      }
+
+      await room.localParticipant.setMicrophoneEnabled(!muted);
+
+      try {
+        await room.startAudio();
+      } catch (error) {
+        console.warn("LiveKit audio playback could not start:", error);
+      }
+    } catch (error) {
+      console.error("Unable to connect to Greenland voice:", error);
+
+      roomRef.current?.disconnect();
+      roomRef.current = null;
+      setVoiceConnected(false);
+    } finally {
+      setVoiceConnecting(false);
+    }
+  };
+
+  const changeInput = async (deviceId: string) => {
     setSelectedInput(deviceId);
     localStorage.setItem("audioInput", deviceId);
+
+    if (roomRef.current) {
+      try {
+        await roomRef.current.switchActiveDevice("audioinput", deviceId);
+      } catch (error) {
+        console.error("Unable to change LiveKit microphone:", error);
+      }
+    }
   };
 
   const changeOutput = (deviceId: string) => {
@@ -326,7 +417,7 @@ function App() {
     }
   };
 
-  const toggleMute = () => {
+  const toggleMute = async () => {
     const nextMuted = !muted;
 
     setMuted(nextMuted);
@@ -334,6 +425,14 @@ function App() {
     streamRef.current?.getAudioTracks().forEach((track) => {
       track.enabled = !nextMuted;
     });
+
+    if (roomRef.current) {
+      try {
+        await roomRef.current.localParticipant.setMicrophoneEnabled(!nextMuted);
+      } catch (error) {
+        console.error("Unable to change LiveKit microphone state:", error);
+      }
+    }
   };
 
   const activeTestDistance = fakePlayerOffset;
@@ -436,6 +535,8 @@ function App() {
       if (testAudioContextRef.current) {
         testAudioContextRef.current.close();
       }
+
+      roomRef.current?.disconnect();
     };
   }, []);
 
@@ -446,6 +547,16 @@ function App() {
       <div className="status">
         <span className={`dot ${backendConnected ? "online" : ""}`} />
         Backend: {backendConnected ? "Connected" : "Disconnected"}
+      </div>
+
+      <div className="status">
+        <span className={`dot ${voiceConnected ? "online" : ""}`} />
+        Voice:{" "}
+        {voiceConnecting
+          ? "Connecting..."
+          : voiceConnected
+            ? "Connected"
+            : "Disconnected"}
       </div>
 
       <div className="status">
@@ -551,7 +662,17 @@ function App() {
         )}
       </div>
 
-      <button className="connect">Connect</button>
+      <button
+        className="connect"
+        onClick={connectVoice}
+        disabled={voiceConnecting || !steamId}
+      >
+        {voiceConnecting
+          ? "Connecting..."
+          : voiceConnected
+            ? "Disconnect Voice"
+            : "Connect Voice"}
+      </button>
     </main>
   );
 }
