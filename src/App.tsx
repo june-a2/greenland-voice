@@ -324,6 +324,24 @@ function App() {
 
   const roomRef = useRef<Room | null>(null);
 
+  const voiceWantedRef = useRef(false);
+
+  const canConnectVoiceRef = useRef(false);
+
+  const serverPresenceConfirmedRef = useRef(false);
+
+  const networkRecoveryPendingRef = useRef(false);
+
+  const autoReconnectTimerRef = useRef<number | null>(null);
+
+  const autoReconnectAttemptsRef = useRef(0);
+
+  const autoReconnectRunningRef = useRef(false);
+
+  const roomRecoveryTimerRef = useRef<number | null>(null);
+
+  const intentionalDisconnectRoomsRef = useRef(new WeakSet<Room>());
+
   const remoteAudioRef = useRef<Map<string, HTMLAudioElement>>(new Map());
 
   const nearbyPlayersRef = useRef<NearbyPlayer[]>([]);
@@ -358,6 +376,20 @@ function App() {
     !!sessionToken &&
     !!gamePid &&
     !!playerPosition;
+
+  const clearAutoReconnect = () => {
+    if (autoReconnectTimerRef.current !== null) {
+      window.clearTimeout(autoReconnectTimerRef.current);
+      autoReconnectTimerRef.current = null;
+    }
+
+    if (roomRecoveryTimerRef.current !== null) {
+      window.clearTimeout(roomRecoveryTimerRef.current);
+      roomRecoveryTimerRef.current = null;
+    }
+
+    autoReconnectRunningRef.current = false;
+  };
 
   const showToast = (
     type: ToastType,
@@ -487,6 +519,44 @@ function App() {
   useEffect(() => {
     listeningForPttRef.current = listeningForPttKey;
   }, [listeningForPttKey]);
+
+  useEffect(() => {
+    canConnectVoiceRef.current = canConnectVoice;
+
+    if (!canConnectVoice) {
+      clearAutoReconnect();
+    }
+  }, [canConnectVoice]);
+
+  useEffect(() => {
+    if (gamePid || (!voiceWantedRef.current && !roomRef.current)) {
+      return;
+    }
+
+    voiceWantedRef.current = false;
+    autoReconnectAttemptsRef.current = 0;
+    clearAutoReconnect();
+
+    const room = roomRef.current;
+
+    if (room) {
+      intentionalDisconnectRoomsRef.current.add(room);
+      room.disconnect();
+    }
+
+    roomRef.current = null;
+    cleanupRemoteAudio();
+    setVoiceConnecting(false);
+    setVoiceConnected(false);
+    setIsTransmitting(false);
+
+    showToast(
+      "info",
+      "The Isle closed",
+      "Voice was disconnected because The Isle is no longer running.",
+      5000,
+    );
+  }, [gamePid]);
 
   useEffect(() => {
     let initialized = false;
@@ -944,9 +1014,19 @@ function App() {
 
   const logoutSteam = async () => {
     try {
+      voiceWantedRef.current = false;
+      networkRecoveryPendingRef.current = false;
+      autoReconnectAttemptsRef.current = 0;
+      clearAutoReconnect();
+
       await setLiveKitMic(false);
 
-      roomRef.current?.disconnect();
+      const room = roomRef.current;
+
+      if (room) {
+        intentionalDisconnectRoomsRef.current.add(room);
+        room.disconnect();
+      }
 
       roomRef.current = null;
 
@@ -986,6 +1066,8 @@ function App() {
 
   useEffect(() => {
     if (!steamId || !sessionToken || !steamVerified) {
+      serverPresenceConfirmedRef.current = false;
+
       nearbyPlayersRef.current = [];
 
       setNearbyPlayers([]);
@@ -1031,6 +1113,8 @@ function App() {
           const snapshot = data as SnapshotMessage;
 
           if (snapshot.self) {
+            serverPresenceConfirmedRef.current = true;
+
             setPlayerPosition({
               x: Number(snapshot.self.x),
 
@@ -1038,8 +1122,53 @@ function App() {
 
               z: Number(snapshot.self.z),
             });
+
+            if (
+              networkRecoveryPendingRef.current &&
+              voiceWantedRef.current &&
+              roomRef.current
+            ) {
+              networkRecoveryPendingRef.current = false;
+              setVoiceConnecting(false);
+              setVoiceConnected(true);
+
+              showToast(
+                "success",
+                "Voice restored",
+                "Greenland PH confirmed you are still in-game and voice has been restored.",
+              );
+            }
           } else {
+            serverPresenceConfirmedRef.current = false;
+            networkRecoveryPendingRef.current = false;
+
             setPlayerPosition(null);
+
+            if (voiceWantedRef.current || roomRef.current) {
+              voiceWantedRef.current = false;
+              autoReconnectAttemptsRef.current = 0;
+              clearAutoReconnect();
+
+              const room = roomRef.current;
+
+              if (room) {
+                intentionalDisconnectRoomsRef.current.add(room);
+                room.disconnect();
+              }
+
+              roomRef.current = null;
+              cleanupRemoteAudio();
+              setVoiceConnecting(false);
+              setVoiceConnected(false);
+              setIsTransmitting(false);
+
+              showToast(
+                "info",
+                "Left Greenland PH",
+                "Voice was disconnected because you are no longer connected to the Greenland PH game server.",
+                5000,
+              );
+            }
           }
 
           const nearby = snapshot.nearby || [];
@@ -1237,6 +1366,87 @@ function App() {
     };
   }, []);
 
+  const scheduleAutoReconnect = (immediate = false) => {
+    if (
+      !voiceWantedRef.current ||
+      !canConnectVoiceRef.current ||
+      !serverPresenceConfirmedRef.current ||
+      roomRef.current ||
+      autoReconnectTimerRef.current !== null ||
+      autoReconnectRunningRef.current
+    ) {
+      return;
+    }
+
+    const attempt = autoReconnectAttemptsRef.current + 1;
+
+    if (attempt > 5) {
+      showToast(
+        "error",
+        "Voice reconnect stopped",
+        "Greenland Voice couldn't restore the connection after several attempts. Use Reconnect to try again.",
+        6500,
+      );
+
+      return;
+    }
+
+    const delays = [0, 1500, 3000, 6000, 10000, 15000];
+    const delay = immediate ? 0 : delays[attempt];
+
+    if (attempt === 1) {
+      showToast(
+        "info",
+        "Voice interrupted",
+        "The voice connection dropped. Greenland Voice is reconnecting automatically.",
+        4200,
+      );
+    }
+
+    autoReconnectTimerRef.current = window.setTimeout(async () => {
+      autoReconnectTimerRef.current = null;
+
+      if (
+        !voiceWantedRef.current ||
+        !canConnectVoiceRef.current ||
+        !serverPresenceConfirmedRef.current ||
+        roomRef.current
+      ) {
+        return;
+      }
+
+      autoReconnectAttemptsRef.current = attempt;
+      autoReconnectRunningRef.current = true;
+
+      try {
+        await startVoiceConnection();
+      } catch (error) {
+        console.error(
+          `Automatic voice reconnect attempt ${attempt} failed:`,
+          error,
+        );
+
+        const failedRoom = roomRef.current;
+
+        if (failedRoom) {
+          intentionalDisconnectRoomsRef.current.add(failedRoom);
+          failedRoom.disconnect();
+        }
+
+        roomRef.current = null;
+        cleanupRemoteAudio();
+        setVoiceConnected(false);
+        setIsTransmitting(false);
+
+        autoReconnectRunningRef.current = false;
+        scheduleAutoReconnect();
+        return;
+      }
+
+      autoReconnectRunningRef.current = false;
+    }, delay);
+  };
+
   const startVoiceConnection = async () => {
     if (
       !steamId ||
@@ -1279,18 +1489,118 @@ function App() {
     const room = new Room();
 
     room.on(RoomEvent.Connected, () => {
+      const recovered = autoReconnectAttemptsRef.current > 0;
+
+      clearAutoReconnect();
+      autoReconnectAttemptsRef.current = 0;
+      setVoiceConnecting(false);
       setVoiceConnected(true);
+
+      if (recovered) {
+        showToast(
+          "success",
+          "Voice restored",
+          "Greenland Voice reconnected automatically.",
+        );
+      }
+    });
+
+    room.on(RoomEvent.Reconnecting, () => {
+      networkRecoveryPendingRef.current = true;
+      serverPresenceConfirmedRef.current = false;
+
+      setVoiceConnected(false);
+      setVoiceConnecting(true);
+      setIsTransmitting(false);
+
+      showToast(
+        "info",
+        "Voice interrupted",
+        "The voice connection was interrupted. Greenland Voice is trying to restore it.",
+        4200,
+      );
+
+      if (roomRecoveryTimerRef.current !== null) {
+        window.clearTimeout(roomRecoveryTimerRef.current);
+      }
+
+      roomRecoveryTimerRef.current = window.setTimeout(() => {
+        roomRecoveryTimerRef.current = null;
+
+        if (
+          roomRef.current !== room ||
+          !voiceWantedRef.current ||
+          !canConnectVoiceRef.current
+        ) {
+          return;
+        }
+
+        intentionalDisconnectRoomsRef.current.add(room);
+        room.disconnect();
+
+        if (roomRef.current === room) {
+          roomRef.current = null;
+        }
+
+        cleanupRemoteAudio();
+        setVoiceConnected(false);
+        setVoiceConnecting(false);
+        setIsTransmitting(false);
+
+        scheduleAutoReconnect(true);
+      }, 12000);
+    });
+
+    room.on(RoomEvent.Reconnected, () => {
+      if (!networkRecoveryPendingRef.current) {
+        return;
+      }
+
+      if (!serverPresenceConfirmedRef.current) {
+        setVoiceConnecting(true);
+        setVoiceConnected(false);
+        setIsTransmitting(false);
+
+        return;
+      }
+
+      networkRecoveryPendingRef.current = false;
+      clearAutoReconnect();
+      autoReconnectAttemptsRef.current = 0;
+      setVoiceConnecting(false);
+      setVoiceConnected(true);
+
+      showToast(
+        "success",
+        "Voice restored",
+        "Greenland PH confirmed you are still in-game and voice has been restored.",
+      );
     });
 
     room.on(RoomEvent.Disconnected, () => {
+      const intentional = intentionalDisconnectRoomsRef.current.has(room);
+
+      if (intentional) {
+        intentionalDisconnectRoomsRef.current.delete(room);
+      }
+
+      if (roomRecoveryTimerRef.current !== null) {
+        window.clearTimeout(roomRecoveryTimerRef.current);
+        roomRecoveryTimerRef.current = null;
+      }
+
       cleanupRemoteAudio();
 
+      setVoiceConnecting(false);
       setVoiceConnected(false);
-
       setIsTransmitting(false);
 
       if (roomRef.current === room) {
         roomRef.current = null;
+      }
+
+      if (!intentional && voiceWantedRef.current) {
+        scheduleAutoReconnect();
       }
     });
 
@@ -1411,9 +1721,16 @@ function App() {
 
   const connectVoice = async () => {
     if (roomRef.current) {
+      voiceWantedRef.current = false;
+      networkRecoveryPendingRef.current = false;
+      autoReconnectAttemptsRef.current = 0;
+      clearAutoReconnect();
+
       await setLiveKitMic(false);
 
-      roomRef.current.disconnect();
+      const room = roomRef.current;
+      intentionalDisconnectRoomsRef.current.add(room);
+      room.disconnect();
 
       roomRef.current = null;
 
@@ -1431,11 +1748,19 @@ function App() {
     }
 
     try {
+      voiceWantedRef.current = true;
+      networkRecoveryPendingRef.current = false;
+      autoReconnectAttemptsRef.current = 0;
+      clearAutoReconnect();
       setVoiceConnecting(true);
 
       await startVoiceConnection();
     } catch (error) {
       console.error("Unable to connect to Greenland voice:", error);
+
+      voiceWantedRef.current = false;
+      autoReconnectAttemptsRef.current = 0;
+      clearAutoReconnect();
 
       showToast(
         "error",
@@ -1466,11 +1791,20 @@ function App() {
     }
 
     try {
+      voiceWantedRef.current = true;
+      networkRecoveryPendingRef.current = false;
+      autoReconnectAttemptsRef.current = 0;
+      clearAutoReconnect();
       setReconnecting(true);
 
       await setLiveKitMic(false);
 
-      roomRef.current?.disconnect();
+      const room = roomRef.current;
+
+      if (room) {
+        intentionalDisconnectRoomsRef.current.add(room);
+        room.disconnect();
+      }
 
       roomRef.current = null;
 
@@ -1483,6 +1817,10 @@ function App() {
       await startVoiceConnection();
     } catch (error) {
       console.error("Unable to reconnect voice:", error);
+
+      voiceWantedRef.current = false;
+      autoReconnectAttemptsRef.current = 0;
+      clearAutoReconnect();
 
       showToast(
         "error",
@@ -1506,6 +1844,19 @@ function App() {
       setReconnecting(false);
     }
   };
+
+  useEffect(() => {
+    if (
+      canConnectVoice &&
+      serverPresenceConfirmedRef.current &&
+      voiceWantedRef.current &&
+      !roomRef.current &&
+      !voiceConnecting &&
+      !reconnecting
+    ) {
+      scheduleAutoReconnect(true);
+    }
+  }, [canConnectVoice, voiceConnecting, reconnecting]);
 
   const changeVoiceMode = async (mode: VoiceMode) => {
     setVoiceMode(mode);
@@ -1706,7 +2057,55 @@ function App() {
   };
 
   useEffect(() => {
+    const handleOffline = () => {
+      serverPresenceConfirmedRef.current = false;
+      networkRecoveryPendingRef.current = voiceWantedRef.current;
+      setPlayerPosition(null);
+
+      if (!voiceWantedRef.current) {
+        return;
+      }
+
+      setVoiceConnected(false);
+      setVoiceConnecting(true);
+      setIsTransmitting(false);
+
+      showToast(
+        "info",
+        "Network unavailable",
+        "Your network connection was lost. Voice will recover automatically when connectivity returns.",
+        5000,
+      );
+    };
+
+    const handleOnline = () => {
+      if (!voiceWantedRef.current) {
+        return;
+      }
+
+      showToast(
+        "info",
+        "Network restored",
+        "Checking whether you are still connected to Greenland PH before restoring voice.",
+        4200,
+      );
+    };
+
+    window.addEventListener("offline", handleOffline);
+    window.addEventListener("online", handleOnline);
+
     return () => {
+      window.removeEventListener("offline", handleOffline);
+      window.removeEventListener("online", handleOnline);
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      voiceWantedRef.current = false;
+      networkRecoveryPendingRef.current = false;
+      clearAutoReconnect();
+
       if (toastTimerRef.current !== null) {
         window.clearTimeout(toastTimerRef.current);
       }
@@ -1719,7 +2118,12 @@ function App() {
 
       cleanupRemoteAudio();
 
-      roomRef.current?.disconnect();
+      const room = roomRef.current;
+
+      if (room) {
+        intentionalDisconnectRoomsRef.current.add(room);
+        room.disconnect();
+      }
     };
   }, []);
 
