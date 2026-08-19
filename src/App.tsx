@@ -22,11 +22,14 @@ function App() {
   const [micLevel, setMicLevel] = useState(0);
   const [muted, setMuted] = useState(false);
   const [gamePid, setGamePid] = useState<number | null>(null);
+  const [backendConnected, setBackendConnected] = useState(false);
+
   const [playerPosition, setPlayerPosition] = useState<{
     x: number;
     y: number;
     z: number;
   } | null>(null);
+
   const [nearbyPlayers, setNearbyPlayers] = useState<
     {
       name: string;
@@ -35,7 +38,9 @@ function App() {
       volume: number;
     }[]
   >([]);
+
   const STEAM_ID = "76561199083876638";
+
   const [testMode, setTestMode] = useState(false);
   const [testPan, setTestPan] = useState(0);
   const [fakePlayerOffset, setFakePlayerOffset] = useState(1000);
@@ -50,6 +55,7 @@ function App() {
   const testDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(
     null,
   );
+
   const testAudioRef = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => {
@@ -173,9 +179,26 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const socket = new WebSocket("ws://localhost:8787");
+    const socket = new WebSocket("wss://greenland-voice.onrender.com/ws");
+
+    socket.onopen = () => {
+      console.log("Connected to Greenland backend");
+      setBackendConnected(true);
+    };
+
+    socket.onerror = (error) => {
+      console.error("Greenland backend WebSocket error:", error);
+      setBackendConnected(false);
+    };
+
+    socket.onclose = () => {
+      console.log("Disconnected from Greenland backend");
+      setBackendConnected(false);
+    };
 
     socket.onmessage = (event) => {
+      console.log("Backend message:", event.data);
+
       const data = JSON.parse(event.data);
 
       if (data.type === "players" && data.players.length > 0) {
@@ -205,6 +228,7 @@ function App() {
                 const dz = player.z - other.z;
 
                 const rawDistance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
                 const maxVoiceDistance = 5000;
 
                 const normalizedDistance = Math.min(
@@ -218,7 +242,7 @@ function App() {
                   name: other.name,
                   steamId: other.steamId,
                   distance: rawDistance,
-                  volume: volume,
+                  volume,
                 };
               },
             )
@@ -230,10 +254,12 @@ function App() {
             const fakeDistance = Math.abs(fakePlayerOffset);
 
             const maxVoiceDistance = 5000;
+
             const normalizedDistance = Math.min(
               fakeDistance / maxVoiceDistance,
               1,
             );
+
             const volume = Math.pow(1 - normalizedDistance, 1.6);
 
             setNearbyPlayers([
@@ -282,7 +308,9 @@ function App() {
   };
 
   const activeTestDistance = fakePlayerOffset;
+
   const normalizedDistance = Math.min(activeTestDistance / 5000, 1);
+
   const proximityVolume = Math.pow(1 - normalizedDistance, 1.6);
 
   useEffect(() => {
@@ -328,8 +356,10 @@ function App() {
       const audioContext = new AudioContext();
 
       const source = audioContext.createMediaStreamSource(streamRef.current);
+
       const gain = audioContext.createGain();
       const panner = audioContext.createStereoPanner();
+
       const destination = audioContext.createMediaStreamDestination();
 
       gain.gain.value = proximityVolume;
@@ -340,6 +370,7 @@ function App() {
       panner.connect(destination);
 
       const audio = new Audio();
+
       audio.srcObject = destination.stream;
 
       if ("setSinkId" in audio && selectedOutput) {
@@ -384,8 +415,8 @@ function App() {
       <h1>GREENLAND VOICE</h1>
 
       <div className="status">
-        <span className="dot" />
-        Disconnected
+        <span className={`dot ${backendConnected ? "online" : ""}`} />
+        Backend: {backendConnected ? "Connected" : "Disconnected"}
       </div>
 
       <div className="status">

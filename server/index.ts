@@ -67,6 +67,7 @@ const httpServer = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({
   server: httpServer,
+  path: "/ws",
 });
 
 wss.on("connection", (client) => {
