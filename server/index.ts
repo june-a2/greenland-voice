@@ -56,6 +56,11 @@ type Session = {
   expiresAt: number;
 };
 
+type RateLimitBucket = {
+  count: number;
+  resetAt: number;
+};
+
 type AuthenticatedClient = {
   socket: WebSocket;
   steamId: string;
@@ -66,6 +71,8 @@ const authRequests = new Map<string, AuthRequest>();
 const sessions = new Map<string, Session>();
 
 const authenticatedClients = new Map<WebSocket, AuthenticatedClient>();
+
+const rateLimitBuckets = new Map<string, RateLimitBucket>();
 
 const AUTH_REQUEST_TTL = 5 * 60 * 1000;
 
@@ -97,7 +104,12 @@ function createRandomToken() {
   return crypto.randomBytes(32).toString("base64url");
 }
 
-function sendJson(res: http.ServerResponse, status: number, data: unknown) {
+function sendJson(
+  res: http.ServerResponse,
+  status: number,
+  data: unknown,
+  extraHeaders: Record<string, string> = {},
+) {
   res.writeHead(status, {
     "Content-Type": "application/json",
 
@@ -106,6 +118,8 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown) {
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
 
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+
+    ...extraHeaders,
   });
 
   res.end(JSON.stringify(data));
@@ -117,6 +131,91 @@ function sendHtml(res: http.ServerResponse, status: number, html: string) {
   });
 
   res.end(html);
+}
+
+function getClientIp(req: http.IncomingMessage) {
+  const forwarded = req.headers["x-forwarded-for"];
+
+  if (Array.isArray(forwarded) && forwarded.length > 0) {
+    return forwarded[0].split(",")[0].trim();
+  }
+
+  if (typeof forwarded === "string" && forwarded.length > 0) {
+    return forwarded.split(",")[0].trim();
+  }
+
+  return req.socket.remoteAddress || "unknown";
+}
+
+function consumeRateLimit(key: string, limit: number, windowMs: number) {
+  const now = Date.now();
+
+  const existing = rateLimitBuckets.get(key);
+
+  if (!existing || existing.resetAt <= now) {
+    const bucket: RateLimitBucket = {
+      count: 1,
+      resetAt: now + windowMs,
+    };
+
+    rateLimitBuckets.set(key, bucket);
+
+    return {
+      allowed: true,
+      remaining: Math.max(0, limit - 1),
+      resetAt: bucket.resetAt,
+    };
+  }
+
+  existing.count += 1;
+
+  return {
+    allowed: existing.count <= limit,
+    remaining: Math.max(0, limit - existing.count),
+    resetAt: existing.resetAt,
+  };
+}
+
+function enforceRateLimit(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  scope: string,
+  limit: number,
+  windowMs: number,
+  subject?: string,
+) {
+  const ip = getClientIp(req);
+
+  const key = `${scope}:${ip}:${subject || ""}`;
+
+  const result = consumeRateLimit(key, limit, windowMs);
+
+  if (result.allowed) {
+    return true;
+  }
+
+  const retryAfterSeconds = Math.max(
+    1,
+    Math.ceil((result.resetAt - Date.now()) / 1000),
+  );
+
+  console.warn(
+    `Rate limit exceeded: ${scope} ip=${ip}${subject ? ` subject=${subject}` : ""}`,
+  );
+
+  sendJson(
+    res,
+    429,
+    {
+      error: "Too many requests",
+      retryAfterSeconds,
+    },
+    {
+      "Retry-After": String(retryAfterSeconds),
+    },
+  );
+
+  return false;
 }
 
 function getBearerToken(req: http.IncomingMessage) {
@@ -161,6 +260,12 @@ function cleanupAuthData() {
   for (const [token, session] of sessions.entries()) {
     if (session.expiresAt <= now) {
       sessions.delete(token);
+    }
+  }
+
+  for (const [key, bucket] of rateLimitBuckets.entries()) {
+    if (bucket.resetAt <= now) {
+      rateLimitBuckets.delete(key);
     }
   }
 }
@@ -371,6 +476,25 @@ const httpServer = http.createServer(async (req, res) => {
         error: "Invalid SteamID",
       });
 
+      return;
+    }
+
+    if (
+      !enforceRateLimit(req, res, "steam-auth-start-ip", 10, 10 * 60 * 1000)
+    ) {
+      return;
+    }
+
+    if (
+      !enforceRateLimit(
+        req,
+        res,
+        "steam-auth-start-user",
+        5,
+        10 * 60 * 1000,
+        expectedSteamId,
+      )
+    ) {
       return;
     }
 
@@ -657,6 +781,19 @@ const httpServer = http.createServer(async (req, res) => {
       return;
     }
 
+    if (
+      !enforceRateLimit(
+        req,
+        res,
+        "steam-auth-status",
+        240,
+        10 * 60 * 1000,
+        authId,
+      )
+    ) {
+      return;
+    }
+
     const authRequest = authRequests.get(authId);
 
     if (!authRequest) {
@@ -699,6 +836,10 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   if (requestUrl.pathname === "/auth/me") {
+    if (!enforceRateLimit(req, res, "auth-me", 60, 60 * 1000)) {
+      return;
+    }
+
     const token = getBearerToken(req);
 
     const session = getSession(token);
@@ -721,6 +862,10 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   if (requestUrl.pathname === "/auth/logout") {
+    if (!enforceRateLimit(req, res, "auth-logout", 30, 60 * 1000)) {
+      return;
+    }
+
     const token = getBearerToken(req);
 
     if (token) {
@@ -745,6 +890,19 @@ const httpServer = http.createServer(async (req, res) => {
           error: "Authentication required",
         });
 
+        return;
+      }
+
+      if (
+        !enforceRateLimit(
+          req,
+          res,
+          "livekit-token",
+          20,
+          60 * 1000,
+          session.steamId,
+        )
+      ) {
         return;
       }
 
